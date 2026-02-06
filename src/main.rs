@@ -22,8 +22,46 @@ fn main() -> Result<(), eframe::Error> {
     eframe::run_native(
         "SpaceInsight",
         options,
-        Box::new(|_cc| Box::new(SpaceInsightApp::default())),
+        Box::new(|cc| {
+            // Configure custom visuals for Apple-inspired aesthetic
+            configure_custom_style(&cc.egui_ctx);
+            Box::new(SpaceInsightApp::default())
+        }),
     )
+}
+
+fn configure_custom_style(ctx: &egui::Context) {
+    let mut style = (*ctx.style()).clone();
+    
+    // Dark theme with deep slate background
+    let mut visuals = egui::Visuals::dark();
+    
+    // Aurora gradient colors (will be rendered manually in background)
+    visuals.panel_fill = egui::Color32::from_rgba_unmultiplied(30, 41, 59, 240);
+    visuals.window_fill = egui::Color32::from_rgba_unmultiplied(30, 41, 59, 230);
+    
+    // Glass morphism - subtle borders
+    visuals.window_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 26));
+    visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 13));
+    
+    // Rounded corners (squircles)
+    visuals.window_rounding = egui::Rounding::same(12.0);
+    visuals.widgets.noninteractive.rounding = egui::Rounding::same(8.0);
+    visuals.widgets.inactive.rounding = egui::Rounding::same(8.0);
+    visuals.widgets.hovered.rounding = egui::Rounding::same(8.0);
+    visuals.widgets.active.rounding = egui::Rounding::same(8.0);
+    
+    // Shadows for depth (using default shadow)
+    visuals.window_shadow = egui::epaint::Shadow::NONE;
+    
+    style.visuals = visuals;
+    
+    // Typography - spacing and sizing
+    style.spacing.item_spacing = egui::vec2(12.0, 8.0);
+    style.spacing.window_margin = egui::Margin::same(24.0);
+    style.spacing.button_padding = egui::vec2(16.0, 8.0);
+    
+    ctx.set_style(style);
 }
 
 struct SpaceInsightApp {
@@ -37,6 +75,8 @@ struct SpaceInsightApp {
     file_tree: Option<FileTree>,
     current_view: Option<indextree::NodeId>,
     navigation_stack: Vec<PathBuf>,
+    // Animation state
+    hovered_index: Option<usize>,
 }
 
 impl Default for SpaceInsightApp {
@@ -51,12 +91,14 @@ impl Default for SpaceInsightApp {
             file_tree: None,
             current_view: None,
             navigation_stack: Vec::new(),
+            hovered_index: None,
         }
     }
 }
 
 struct ScanResult {
     tree: FileTree,
+    #[allow(dead_code)]
     stats: ScanStats,
 }
 
@@ -98,7 +140,6 @@ impl SpaceInsightApp {
 
             for path_entry in paths {
                 if let Some(node) = nodes.get(&path_entry) {
-                    // Skip if this path is already in the tree (e.g., the root)
                     if tree.get_node(&node.path).is_none() {
                         tree.add_node(node.path.clone(), node.size, node.is_dir);
                     }
@@ -119,12 +160,10 @@ impl SpaceInsightApp {
     }
 
     fn update_layout(&mut self, container_rect: egui::Rect) {
-        // Check if there's a scan result ready (non-blocking check)
         let scan_complete = if let Ok(mut result_guard) = self.scan_result.try_lock() {
             if let Some(result) = result_guard.take() {
                 self.is_scanning = false;
                 
-                // Store the tree for navigation
                 let root = result.tree.get_root();
                 self.current_view = Some(root);
                 self.file_tree = Some(result.tree);
@@ -139,15 +178,11 @@ impl SpaceInsightApp {
         };
         
         if scan_complete {
-            // Populate items for the root view
             self.populate_current_view();
-
             println!("Scan completed! Found {} items", self.tree_items.len());
-            
             self.has_data = !self.tree_items.is_empty();
         }
         
-        // Recalculate layout if we have data and container size changed
         if self.has_data && !self.tree_items.is_empty() {
             let items: Vec<TreemapItem> = self.tree_items
                 .iter()
@@ -192,7 +227,6 @@ impl SpaceInsightApp {
     fn navigate_to(&mut self, path: &PathBuf) {
         if let Some(tree) = &self.file_tree {
             if let Some(node_id) = tree.get_node(path) {
-                // Add current path to navigation stack
                 if let Some(current_id) = self.current_view {
                     if let Some(current_node) = tree.get_arena().get(current_id) {
                         self.navigation_stack.push(current_node.get().path.clone());
@@ -231,6 +265,84 @@ impl SpaceInsightApp {
             format!("{} B", size)
         }
     }
+
+    /// Temperature-based color palette: cool blues → warm amber → energetic coral
+    fn get_temperature_color(size_ratio: f32, is_hovered: bool) -> egui::Color32 {
+        let (r, g, b) = if size_ratio < 0.15 {
+            // Cool blue range for small files
+            let t = size_ratio / 0.15;
+            (59.0 + 80.0 * t, 130.0 + 35.0 * t, 246.0)
+        } else if size_ratio < 0.4 {
+            // Purple range for medium files
+            (139.0, 92.0, 246.0)
+        } else if size_ratio < 0.7 {
+            // Amber range for large files
+            let t = (size_ratio - 0.4) / 0.3;
+            (245.0 + 6.0 * t, 158.0 + 33.0 * t, 11.0 + 25.0 * t)
+        } else {
+            // Coral range for very large files
+            let t = (size_ratio - 0.7) / 0.3;
+            (239.0 + 9.0 * t, 68.0 + 45.0 * t, 68.0 + 45.0 * t)
+        };
+
+        let (r, g, b) = if is_hovered {
+            ((r * 1.15).min(255.0), (g * 1.15).min(255.0), (b * 1.15).min(255.0))
+        } else {
+            (r, g, b)
+        };
+
+        egui::Color32::from_rgb(r as u8, g as u8, b as u8)
+    }
+
+    /// Draw aurora gradient background that shifts with folder depth
+    fn draw_aurora_background(&self, painter: &egui::Painter, rect: egui::Rect) {
+        let depth = self.navigation_stack.len() as f32;
+        let depth_factor = (depth * 0.1).min(0.3);
+        
+        let top_color = egui::Color32::from_rgb(
+            (30.0 - depth_factor * 10.0) as u8,
+            (41.0 + depth_factor * 35.0) as u8,
+            (59.0 + depth_factor * 59.0) as u8,
+        );
+        
+        let bottom_color = egui::Color32::from_rgb(
+            (15.0 - depth_factor * 5.0) as u8,
+            (118.0 - depth_factor * 20.0) as u8,
+            (110.0 + depth_factor * 8.0) as u8,
+        );
+        
+        let mesh = Self::create_gradient_mesh(rect, top_color, bottom_color);
+        painter.add(egui::Shape::Mesh(mesh));
+    }
+    
+    fn create_gradient_mesh(rect: egui::Rect, top_color: egui::Color32, bottom_color: egui::Color32) -> egui::Mesh {
+        let mut mesh = egui::Mesh::default();
+        
+        mesh.vertices.push(egui::epaint::Vertex {
+            pos: rect.left_top(),
+            uv: egui::pos2(0.0, 0.0),
+            color: top_color,
+        });
+        mesh.vertices.push(egui::epaint::Vertex {
+            pos: rect.right_top(),
+            uv: egui::pos2(1.0, 0.0),
+            color: top_color,
+        });
+        mesh.vertices.push(egui::epaint::Vertex {
+            pos: rect.right_bottom(),
+            uv: egui::pos2(1.0, 1.0),
+            color: bottom_color,
+        });
+        mesh.vertices.push(egui::epaint::Vertex {
+            pos: rect.left_bottom(),
+            uv: egui::pos2(0.0, 1.0),
+            color: bottom_color,
+        });
+        
+        mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
+        
+        mesh
+    }
 }
 
 impl eframe::App for SpaceInsightApp {
@@ -260,7 +372,6 @@ impl eframe::App for SpaceInsightApp {
             // Breadcrumb navigation
             if self.has_data && self.file_tree.is_some() {
                 ui.horizontal(|ui| {
-                    // Back button
                     if !self.navigation_stack.is_empty() {
                         if ui.button("⬅ Back").clicked() {
                             self.navigate_back();
@@ -269,7 +380,6 @@ impl eframe::App for SpaceInsightApp {
                     
                     ui.separator();
                     
-                    // Show current path
                     if let (Some(tree), Some(current_id)) = (&self.file_tree, self.current_view) {
                         if let Some(node) = tree.get_arena().get(current_id) {
                             let current_path = &node.get().path;
@@ -284,83 +394,120 @@ impl eframe::App for SpaceInsightApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             let available_rect = ui.available_rect_before_wrap();
             
-            // Update layout if scan completed
             self.update_layout(available_rect);
 
-            // Draw treemap with click detection
             let painter = ui.painter();
-            let mut clicked_path: Option<PathBuf> = None;
             
-            for layout_rect in &self.layout {
+            // Draw aurora gradient background
+            self.draw_aurora_background(painter, available_rect);
+            
+            let mut clicked_path: Option<PathBuf> = None;
+            let mut new_hovered_index: Option<usize> = None;
+            let total_size: u64 = self.tree_items.iter().map(|i| i.size).sum();
+            
+            for (idx, layout_rect) in self.layout.iter().enumerate() {
                 if layout_rect.index < self.tree_items.len() {
                     let item = &self.tree_items[layout_rect.index];
                     let rect = layout_rect.rect;
                     
+                    // Add padding between rectangles for breathing room
+                    let padded_rect = Rect::new(
+                        rect.x + 2.0,
+                        rect.y + 2.0,
+                        (rect.width - 4.0).max(1.0),
+                        (rect.height - 4.0).max(1.0),
+                    );
+                    
                     let egui_rect = egui::Rect::from_min_size(
-                        egui::pos2(rect.x, rect.y),
-                        egui::vec2(rect.width, rect.height),
+                        egui::pos2(padded_rect.x, padded_rect.y),
+                        egui::vec2(padded_rect.width, padded_rect.height),
                     );
 
-                    // Check for clicks on this rectangle
-                    let response = ui.interact(egui_rect, ui.id().with(layout_rect.index), egui::Sense::click());
+                    let response = ui.interact(egui_rect, ui.id().with(idx), egui::Sense::click());
+                    let is_hovered = response.hovered();
                     
-                    // Color based on size and hover state
-                    let total_size: u64 = self.tree_items.iter().map(|i| i.size).sum();
+                    if is_hovered {
+                        new_hovered_index = Some(idx);
+                        if item.is_dir {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                        }
+                    }
+                    
+                    if response.clicked() && item.is_dir {
+                        clicked_path = Some(item.path.clone());
+                    }
+
                     let size_ratio = if total_size > 0 {
                         item.size as f32 / total_size as f32
                     } else {
                         0.0
                     };
                     
-                    let hue = size_ratio * 0.6; // Range from 0 (red) to 0.6 (cyan)
-                    let mut color = egui::Color32::from_rgb(
-                        (255.0 * (1.0 - hue)) as u8,
-                        (255.0 * hue) as u8,
-                        128,
+                    let color = Self::get_temperature_color(size_ratio, is_hovered);
+                    
+                    // Draw shadow for depth
+                    let shadow_rect = egui_rect.translate(egui::vec2(0.0, 2.0));
+                    painter.rect(
+                        shadow_rect,
+                        10.0,
+                        egui::Color32::from_rgba_unmultiplied(0, 0, 0, 25),
+                        egui::Stroke::NONE,
+                    );
+
+                    // Draw main rectangle with rounded corners (squircles)
+                    let corner_radius = (padded_rect.width.min(padded_rect.height) * 0.08).min(12.0);
+                    painter.rect(
+                        egui_rect,
+                        corner_radius,
+                        color,
+                        egui::Stroke::NONE,
                     );
                     
-                    // Brighten color on hover for directories
-                    if response.hovered() && item.is_dir {
-                        let bright_r = (255.0_f32 * (1.0 - hue) * 1.2).min(255.0);
-                        let bright_g = (255.0_f32 * hue * 1.2).min(255.0);
-                        let bright_b = (128.0_f32 * 1.2).min(255.0);
-                        color = egui::Color32::from_rgb(
-                            bright_r as u8,
-                            bright_g as u8,
-                            bright_b as u8,
-                        );
-                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                    }
-                    
-                    // Handle click on directory
-                    if response.clicked() && item.is_dir {
-                        clicked_path = Some(item.path.clone());
-                    }
+                    // Glass morphism border
+                    painter.rect_stroke(
+                        egui_rect,
+                        corner_radius,
+                        egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 30)),
+                    );
 
-                    painter.rect_filled(egui_rect, 2.0, color);
-                    painter.rect_stroke(egui_rect, 2.0, (1.0, egui::Color32::BLACK));
-
-                    // Draw label if there's enough space
-                    if rect.width > 50.0 && rect.height > 20.0 {
-                        let dir_indicator = if item.is_dir { "📁 " } else { "📄 " };
-                        let text = format!("{}{}\n{}", dir_indicator, item.name, Self::format_size(item.size));
+                    // Smart label placement - only show if enough space
+                    let min_label_area = 2500.0;
+                    if padded_rect.width * padded_rect.height > min_label_area {
+                        let dir_indicator = if item.is_dir { "📁" } else { "📄" };
+                        
+                        let (name_size, size_size) = if padded_rect.width * padded_rect.height > 10000.0 {
+                            (14.0, 11.0)
+                        } else {
+                            (12.0, 10.0)
+                        };
+                        
+                        let name_text = format!("{} {}", dir_indicator, item.name);
                         painter.text(
-                            egui_rect.center(),
+                            egui::pos2(egui_rect.center().x, egui_rect.center().y - 8.0),
                             egui::Align2::CENTER_CENTER,
-                            text,
-                            egui::FontId::proportional(10.0),
+                            name_text,
+                            egui::FontId::proportional(name_size),
                             egui::Color32::WHITE,
+                        );
+                        
+                        let size_text = Self::format_size(item.size);
+                        painter.text(
+                            egui::pos2(egui_rect.center().x, egui_rect.center().y + 8.0),
+                            egui::Align2::CENTER_CENTER,
+                            size_text,
+                            egui::FontId::proportional(size_size),
+                            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 153),
                         );
                     }
                 }
             }
             
-            // Navigate if a directory was clicked
+            self.hovered_index = new_hovered_index;
+            
             if let Some(path) = clicked_path {
                 self.navigate_to(&path);
             }
 
-            // Request repaint if scanning
             if self.is_scanning {
                 ctx.request_repaint();
             }
