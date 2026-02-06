@@ -26,7 +26,6 @@ fn main() -> Result<(), eframe::Error> {
     )
 }
 
-#[derive(Default)]
 struct SpaceInsightApp {
     scan_path: String,
     is_scanning: bool,
@@ -34,6 +33,26 @@ struct SpaceInsightApp {
     layout: Vec<LayoutRect>,
     tree_items: Vec<TreeItem>,
     has_data: bool,
+    // Navigation state
+    file_tree: Option<FileTree>,
+    current_view: Option<indextree::NodeId>,
+    navigation_stack: Vec<PathBuf>,
+}
+
+impl Default for SpaceInsightApp {
+    fn default() -> Self {
+        Self {
+            scan_path: String::default(),
+            is_scanning: false,
+            scan_result: Arc::new(Mutex::new(None)),
+            layout: Vec::new(),
+            tree_items: Vec::new(),
+            has_data: false,
+            file_tree: None,
+            current_view: None,
+            navigation_stack: Vec::new(),
+        }
+    }
 }
 
 struct ScanResult {
@@ -46,6 +65,7 @@ struct TreeItem {
     path: PathBuf,
     name: String,
     size: u64,
+    is_dir: bool,
 }
 
 impl SpaceInsightApp {
@@ -100,32 +120,31 @@ impl SpaceInsightApp {
 
     fn update_layout(&mut self, container_rect: egui::Rect) {
         // Check if there's a scan result ready (non-blocking check)
-        if let Ok(mut result_guard) = self.scan_result.try_lock() {
+        let scan_complete = if let Ok(mut result_guard) = self.scan_result.try_lock() {
             if let Some(result) = result_guard.take() {
                 self.is_scanning = false;
                 
-                // Get root node and collect immediate children
+                // Store the tree for navigation
                 let root = result.tree.get_root();
-                let arena = result.tree.get_arena();
+                self.current_view = Some(root);
+                self.file_tree = Some(result.tree);
+                self.navigation_stack.clear();
                 
-                self.tree_items.clear();
-                
-                for child_id in root.children(arena) {
-                    if let Some(node) = arena.get(child_id) {
-                        let data = node.get();
-                        self.tree_items.push(TreeItem {
-                            path: data.path.clone(),
-                            name: data.name.clone(),
-                            size: data.cumulative_size,
-                        });
-                    }
-                }
-
-                println!("Scan completed! Found {} items", self.tree_items.len());
-                println!("Stats: {} files, {} dirs", result.stats.total_files, result.stats.total_dirs);
-                
-                self.has_data = !self.tree_items.is_empty();
+                true
+            } else {
+                false
             }
+        } else {
+            false
+        };
+        
+        if scan_complete {
+            // Populate items for the root view
+            self.populate_current_view();
+
+            println!("Scan completed! Found {} items", self.tree_items.len());
+            
+            self.has_data = !self.tree_items.is_empty();
         }
         
         // Recalculate layout if we have data and container size changed
@@ -147,6 +166,53 @@ impl SpaceInsightApp {
             );
 
             self.layout = SquarifiedTreemap::layout(&items, container);
+        }
+    }
+
+    fn populate_current_view(&mut self) {
+        self.tree_items.clear();
+        
+        if let (Some(tree), Some(current_id)) = (&self.file_tree, self.current_view) {
+            let arena = tree.get_arena();
+            
+            for child_id in current_id.children(arena) {
+                if let Some(node) = arena.get(child_id) {
+                    let data = node.get();
+                    self.tree_items.push(TreeItem {
+                        path: data.path.clone(),
+                        name: data.name.clone(),
+                        size: data.cumulative_size,
+                        is_dir: data.is_dir,
+                    });
+                }
+            }
+        }
+    }
+
+    fn navigate_to(&mut self, path: &PathBuf) {
+        if let Some(tree) = &self.file_tree {
+            if let Some(node_id) = tree.get_node(path) {
+                // Add current path to navigation stack
+                if let Some(current_id) = self.current_view {
+                    if let Some(current_node) = tree.get_arena().get(current_id) {
+                        self.navigation_stack.push(current_node.get().path.clone());
+                    }
+                }
+                
+                self.current_view = Some(node_id);
+                self.populate_current_view();
+            }
+        }
+    }
+
+    fn navigate_back(&mut self) {
+        if let Some(previous_path) = self.navigation_stack.pop() {
+            if let Some(tree) = &self.file_tree {
+                if let Some(node_id) = tree.get_node(&previous_path) {
+                    self.current_view = Some(node_id);
+                    self.populate_current_view();
+                }
+            }
         }
     }
 
@@ -190,6 +256,29 @@ impl eframe::App for SpaceInsightApp {
                     ui.label(format!("Items: {}", self.tree_items.len()));
                 }
             });
+            
+            // Breadcrumb navigation
+            if self.has_data && self.file_tree.is_some() {
+                ui.horizontal(|ui| {
+                    // Back button
+                    if !self.navigation_stack.is_empty() {
+                        if ui.button("⬅ Back").clicked() {
+                            self.navigate_back();
+                        }
+                    }
+                    
+                    ui.separator();
+                    
+                    // Show current path
+                    if let (Some(tree), Some(current_id)) = (&self.file_tree, self.current_view) {
+                        if let Some(node) = tree.get_arena().get(current_id) {
+                            let current_path = &node.get().path;
+                            ui.label("📁");
+                            ui.label(format!("{}", current_path.display()));
+                        }
+                    }
+                });
+            }
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -198,8 +287,9 @@ impl eframe::App for SpaceInsightApp {
             // Update layout if scan completed
             self.update_layout(available_rect);
 
-            // Draw treemap
+            // Draw treemap with click detection
             let painter = ui.painter();
+            let mut clicked_path: Option<PathBuf> = None;
             
             for layout_rect in &self.layout {
                 if layout_rect.index < self.tree_items.len() {
@@ -211,7 +301,10 @@ impl eframe::App for SpaceInsightApp {
                         egui::vec2(rect.width, rect.height),
                     );
 
-                    // Color based on size (hue varies with size)
+                    // Check for clicks on this rectangle
+                    let response = ui.interact(egui_rect, ui.id().with(layout_rect.index), egui::Sense::click());
+                    
+                    // Color based on size and hover state
                     let total_size: u64 = self.tree_items.iter().map(|i| i.size).sum();
                     let size_ratio = if total_size > 0 {
                         item.size as f32 / total_size as f32
@@ -220,18 +313,37 @@ impl eframe::App for SpaceInsightApp {
                     };
                     
                     let hue = size_ratio * 0.6; // Range from 0 (red) to 0.6 (cyan)
-                    let color = egui::Color32::from_rgb(
+                    let mut color = egui::Color32::from_rgb(
                         (255.0 * (1.0 - hue)) as u8,
                         (255.0 * hue) as u8,
                         128,
                     );
+                    
+                    // Brighten color on hover for directories
+                    if response.hovered() && item.is_dir {
+                        let bright_r = (255.0_f32 * (1.0 - hue) * 1.2).min(255.0);
+                        let bright_g = (255.0_f32 * hue * 1.2).min(255.0);
+                        let bright_b = (128.0_f32 * 1.2).min(255.0);
+                        color = egui::Color32::from_rgb(
+                            bright_r as u8,
+                            bright_g as u8,
+                            bright_b as u8,
+                        );
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
+                    
+                    // Handle click on directory
+                    if response.clicked() && item.is_dir {
+                        clicked_path = Some(item.path.clone());
+                    }
 
                     painter.rect_filled(egui_rect, 2.0, color);
                     painter.rect_stroke(egui_rect, 2.0, (1.0, egui::Color32::BLACK));
 
                     // Draw label if there's enough space
                     if rect.width > 50.0 && rect.height > 20.0 {
-                        let text = format!("{}\n{}", item.name, Self::format_size(item.size));
+                        let dir_indicator = if item.is_dir { "📁 " } else { "📄 " };
+                        let text = format!("{}{}\n{}", dir_indicator, item.name, Self::format_size(item.size));
                         painter.text(
                             egui_rect.center(),
                             egui::Align2::CENTER_CENTER,
@@ -241,6 +353,11 @@ impl eframe::App for SpaceInsightApp {
                         );
                     }
                 }
+            }
+            
+            // Navigate if a directory was clicked
+            if let Some(path) = clicked_path {
+                self.navigate_to(&path);
             }
 
             // Request repaint if scanning
