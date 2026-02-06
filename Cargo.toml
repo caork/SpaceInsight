@@ -1,0 +1,17 @@
+[package]
+name = "spaceinsight"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+eframe = "0.26"  # Modern GPU-backed UI
+jwalk = "0.8"    # Fast parallel walking
+rayon = "1.8"    # Multi-threading
+indextree = "4.6" # High-perf Arena tree
+dashmap = "6.1"  # Thread-safe HashMap
+serde = { version = "1.0", features = ["derive"] }
+
+[profile.release]
+lto = "fat"         # Heavy optimization
+codegen-units = 1   # Better performance
+panic = "abort"     # Smaller binary size
