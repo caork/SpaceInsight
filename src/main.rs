@@ -24,7 +24,7 @@ const TILE_CORNER_MAX: f32 = 8.0;
 const TILE_BORDER_WIDTH_DIR: f32 = 0.85;
 const TILE_BORDER_WIDTH_FILE: f32 = 0.75;
 const TILE_BORDER_WIDTH_AGG: f32 = 0.7;
-const AUTO_JUMP_DEFAULT_SENSITIVITY: f32 = 0.08;
+const AUTO_JUMP_SENSITIVITY: f32 = 0.0;
 const AUTO_JUMP_MIN_USEFUL_AREA: f32 = 400.0;
 const AUTO_JUMP_MIN_AREA_PCT: f32 = 0.005;
 const AUTO_JUMP_VISIBLE_CAP: usize = 12;
@@ -105,7 +105,6 @@ struct SpaceInsightApp {
     last_container_rect: Option<egui::Rect>,
     // Cached top-level items for animation
     top_level_items: Vec<TopLevelItem>,
-    auto_jump_sensitivity: f32,
 }
 
 #[derive(Clone)]
@@ -133,7 +132,6 @@ impl Default for SpaceInsightApp {
             last_frame_time: None,
             last_container_rect: None,
             top_level_items: Vec::new(),
-            auto_jump_sensitivity: AUTO_JUMP_DEFAULT_SENSITIVITY,
         }
     }
 }
@@ -428,7 +426,7 @@ impl SpaceInsightApp {
             0.0
         };
 
-        let sensitivity = self.auto_jump_sensitivity.clamp(0.0, 1.0);
+        let sensitivity = AUTO_JUMP_SENSITIVITY;
         let hidden_threshold = 0.92 - 0.45 * sensitivity;
         let pressure_threshold = 1.55 - 0.7 * sensitivity;
         let visible_min_needed = if sensitivity < 0.35 { 3 } else { 2 };
@@ -460,6 +458,81 @@ impl SpaceInsightApp {
             || overloaded_visible
             || pressure_too_high
             || region_too_small_for_density
+    }
+
+    fn pick_folder_path() -> Option<PathBuf> {
+        #[cfg(target_os = "macos")]
+        {
+            let output = Command::new("osascript")
+                .args([
+                    "-e",
+                    "POSIX path of (choose folder with prompt \"Select folder to scan\")",
+                ])
+                .output()
+                .ok()?;
+
+            if !output.status.success() {
+                return None;
+            }
+
+            let selected = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if selected.is_empty() {
+                None
+            } else {
+                Some(PathBuf::from(selected))
+            }
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            let script = "Add-Type -AssemblyName System.Windows.Forms; $dlg = New-Object System.Windows.Forms.FolderBrowserDialog; $dlg.ShowNewFolderButton = $false; if ($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output $dlg.SelectedPath }";
+            let output = Command::new("powershell")
+                .args(["-NoProfile", "-Command", script])
+                .output()
+                .ok()?;
+
+            if !output.status.success() {
+                return None;
+            }
+
+            let selected = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if selected.is_empty() {
+                None
+            } else {
+                Some(PathBuf::from(selected))
+            }
+        }
+
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            let zenity = Command::new("zenity")
+                .args(["--file-selection", "--directory"])
+                .output();
+
+            if let Ok(output) = zenity {
+                if output.status.success() {
+                    let selected = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                    if !selected.is_empty() {
+                        return Some(PathBuf::from(selected));
+                    }
+                }
+            }
+
+            let kdialog = Command::new("kdialog")
+                .args(["--getexistingdirectory"])
+                .output();
+
+            if let Ok(output) = kdialog {
+                if output.status.success() {
+                    let selected = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                    if !selected.is_empty() {
+                        return Some(PathBuf::from(selected));
+                    }
+                }
+            }
+
+            None
+        }
     }
 
     fn maybe_zoom_into_folder(&mut self, path: &Path, viewport_rect: egui::Rect) -> bool {
@@ -1109,6 +1182,12 @@ impl eframe::App for SpaceInsightApp {
                 ui.label("Path:");
                 ui.text_edit_singleline(&mut self.scan_path);
 
+                if ui.button("Browse...").clicked() {
+                    if let Some(path) = Self::pick_folder_path() {
+                        self.scan_path = path.display().to_string();
+                    }
+                }
+
                 if ui.button("Scan").clicked() {
                     self.start_scan();
                 }
@@ -1125,22 +1204,6 @@ impl eframe::App for SpaceInsightApp {
                             self.rebuild_render_tree(rect);
                         }
                     }
-
-                    ui.separator();
-                    ui.label("Auto Jump:");
-                    ui.add(
-                        egui::Slider::new(&mut self.auto_jump_sensitivity, 0.0..=1.0)
-                            .show_value(false),
-                    );
-                    self.auto_jump_sensitivity = self.auto_jump_sensitivity.clamp(0.0, 1.0);
-                    let profile = if self.auto_jump_sensitivity < 0.34 {
-                        "Conservative"
-                    } else if self.auto_jump_sensitivity < 0.67 {
-                        "Balanced"
-                    } else {
-                        "Aggressive"
-                    };
-                    ui.label(profile).on_hover_text("Lower = less likely to auto jump into a folder.");
                 }
             });
 
