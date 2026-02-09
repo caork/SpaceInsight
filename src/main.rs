@@ -18,6 +18,12 @@ use render_tree::{build_render_tree, RenderNode, BORDER_VISUAL_WIDTH, HEADER_HEI
 use tree::FileTree;
 use treemap::{Rect, SquarifiedTreemap, TreemapItem};
 
+const TILE_GUTTER: f32 = 1.0;
+const TILE_CORNER_MAX: f32 = 8.0;
+const TILE_BORDER_WIDTH_DIR: f32 = 0.85;
+const TILE_BORDER_WIDTH_FILE: f32 = 0.75;
+const TILE_BORDER_WIDTH_AGG: f32 = 0.7;
+
 fn main() -> Result<(), eframe::Error> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -444,7 +450,7 @@ impl SpaceInsightApp {
                 }
             } else {
                 // --- Collapsed / leaf node ---
-                let gutter = 2.0;
+                let gutter = TILE_GUTTER;
                 let px = node.outer_rect.x + gutter;
                 let py = node.outer_rect.y + gutter;
                 let pw = (node.outer_rect.width - 2.0 * gutter).max(1.0);
@@ -479,7 +485,7 @@ impl SpaceInsightApp {
                     }
                 }
 
-                let corner_radius = (pw.min(ph) * 0.08).min(12.0);
+                let corner_radius = (pw.min(ph) * 0.06).min(TILE_CORNER_MAX);
 
                 if node.is_aggregate {
                     // --- Aggregate block: grey ---
@@ -493,7 +499,7 @@ impl SpaceInsightApp {
                         egui_rect,
                         corner_radius,
                         egui::Stroke::new(
-                            1.0,
+                            TILE_BORDER_WIDTH_AGG,
                             egui::Color32::from_rgba_unmultiplied(255, 255, 255, 20),
                         ),
                     );
@@ -546,12 +552,12 @@ impl SpaceInsightApp {
                     // Border
                     let border_stroke = if node.is_dir {
                         egui::Stroke::new(
-                            1.5,
+                            TILE_BORDER_WIDTH_DIR,
                             egui::Color32::from_rgba_unmultiplied(255, 255, 255, 50),
                         )
                     } else {
                         egui::Stroke::new(
-                            1.0,
+                            TILE_BORDER_WIDTH_FILE,
                             egui::Color32::from_rgba_unmultiplied(255, 255, 255, 30),
                         )
                     };
@@ -643,10 +649,10 @@ impl SpaceInsightApp {
             let item = &self.top_level_items[item_index];
             let opacity = anim.current.opacity;
 
-            let px = anim.current.x + 2.0;
-            let py = anim.current.y + 2.0;
-            let pw = (anim.current.w - 4.0).max(1.0);
-            let ph = (anim.current.h - 4.0).max(1.0);
+            let px = anim.current.x + TILE_GUTTER;
+            let py = anim.current.y + TILE_GUTTER;
+            let pw = (anim.current.w - 2.0 * TILE_GUTTER).max(1.0);
+            let ph = (anim.current.h - 2.0 * TILE_GUTTER).max(1.0);
 
             let egui_rect =
                 egui::Rect::from_min_size(egui::pos2(px, py), egui::vec2(pw, ph));
@@ -676,17 +682,17 @@ impl SpaceInsightApp {
                 );
             }
 
-            let corner_radius = (pw.min(ph) * 0.08).min(12.0);
+            let corner_radius = (pw.min(ph) * 0.06).min(TILE_CORNER_MAX);
             painter.rect(egui_rect, corner_radius, color, egui::Stroke::NONE);
 
             let border_stroke = if item.is_dir {
                 egui::Stroke::new(
-                    1.5,
+                    TILE_BORDER_WIDTH_DIR,
                     egui::Color32::from_rgba_unmultiplied(255, 255, 255, (50.0 * opacity) as u8),
                 )
             } else {
                 egui::Stroke::new(
-                    1.0,
+                    TILE_BORDER_WIDTH_FILE,
                     egui::Color32::from_rgba_unmultiplied(255, 255, 255, (30.0 * opacity) as u8),
                 )
             };

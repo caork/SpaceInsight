@@ -7,13 +7,13 @@ use crate::tree::FileTree;
 use crate::treemap::{Rect, SquarifiedTreemap, TreemapItem};
 
 /// Visible border thickness (drawn).
-pub const BORDER_VISUAL_WIDTH: f32 = 1.5;
+pub const BORDER_VISUAL_WIDTH: f32 = 0.8;
 
 /// Height of the header bar on expanded folders (label + collapse hit zone).
 pub const HEADER_HEIGHT: f32 = 16.0;
 
 /// Minimal inset on left/right/bottom of expanded folders.
-pub const SIDE_INSET: f32 = 2.0;
+pub const SIDE_INSET: f32 = 1.0;
 
 /// Maximum expansion depth.
 pub const MAX_EXPAND_DEPTH: u8 = 4;

@@ -1,6 +1,9 @@
 use std::f32;
 
-/// Minimum pixel dimension for tiny items
+/// Threshold used to mark tiny items (for rendering decisions only).
+///
+/// Important: layout must never expand rectangles to this size, otherwise
+/// neighboring tiles can overlap.
 pub const MIN_VISIBLE_SIZE: f32 = 16.0;
 
 /// Rectangle structure for treemap layout
@@ -83,13 +86,9 @@ impl SquarifiedTreemap {
         let mut result = Vec::with_capacity(items.len());
         Self::squarify(&normalized, &mut result, container);
 
-        // Post-process: clamp tiny items to minimum visible size
+        // Post-process: mark tiny items only (do NOT resize, to avoid overlaps)
         for lr in &mut result {
-            if lr.rect.width < MIN_VISIBLE_SIZE || lr.rect.height < MIN_VISIBLE_SIZE {
-                lr.is_tiny = true;
-                lr.rect.width = lr.rect.width.max(MIN_VISIBLE_SIZE);
-                lr.rect.height = lr.rect.height.max(MIN_VISIBLE_SIZE);
-            }
+            lr.is_tiny = lr.rect.width < MIN_VISIBLE_SIZE || lr.rect.height < MIN_VISIBLE_SIZE;
         }
 
         result
@@ -242,8 +241,12 @@ impl SquarifiedTreemap {
 
         let mut offset = 0.0f32;
 
-        for &(index, size) in row {
-            let item_length = if total > 0.0 {
+        for (row_index, &(index, size)) in row.iter().enumerate() {
+            let item_length = if row_index + 1 == row.len() {
+                // Ensure the final item closes the row exactly; avoids float drift
+                // causing tiny gaps or overlaps between neighbors.
+                (length - offset).max(0.0)
+            } else if total > 0.0 {
                 size / total * length
             } else {
                 0.0
@@ -272,8 +275,14 @@ impl SquarifiedTreemap {
             container.height
         };
 
+        let max_breadth = if horizontal {
+            container.height
+        } else {
+            container.width
+        };
+
         let row_breadth = if row_total > 0.0 && length > 0.0 {
-            row_total / length
+            (row_total / length).min(max_breadth)
         } else {
             0.0
         };
@@ -363,5 +372,43 @@ mod tests {
             "Total area ratio {} should be close to 1.0",
             ratio
         );
+    }
+
+    #[test]
+    fn test_many_small_items_do_not_overlap() {
+        let mut items = vec![TreemapItem { size: 5_000, index: 0 }];
+        for index in 1..50 {
+            items.push(TreemapItem { size: 8 + index as u64, index });
+        }
+
+        let container = Rect::new(0.0, 0.0, 1200.0, 780.0);
+        let layout = SquarifiedTreemap::layout(&items, container);
+
+        assert_eq!(layout.len(), items.len());
+
+        for lr in &layout {
+            assert!(lr.rect.x >= container.x - 0.001);
+            assert!(lr.rect.y >= container.y - 0.001);
+            assert!(lr.rect.x + lr.rect.width <= container.x + container.width + 0.001);
+            assert!(lr.rect.y + lr.rect.height <= container.y + container.height + 0.001);
+        }
+
+        for i in 0..layout.len() {
+            for j in (i + 1)..layout.len() {
+                let a = layout[i].rect;
+                let b = layout[j].rect;
+
+                let overlap_w = (a.x + a.width).min(b.x + b.width) - a.x.max(b.x);
+                let overlap_h = (a.y + a.height).min(b.y + b.height) - a.y.max(b.y);
+
+                // Touching edges is fine; positive overlap area is not.
+                assert!(
+                    !(overlap_w > 0.01 && overlap_h > 0.01),
+                    "Rects {} and {} overlap",
+                    i,
+                    j
+                );
+            }
+        }
     }
 }
