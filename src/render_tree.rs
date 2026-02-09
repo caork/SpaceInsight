@@ -15,9 +15,6 @@ pub const HEADER_HEIGHT: f32 = 16.0;
 /// Minimal inset on left/right/bottom of expanded folders.
 pub const SIDE_INSET: f32 = 1.0;
 
-/// Maximum expansion depth.
-pub const MAX_EXPAND_DEPTH: u8 = 4;
-
 // --- Aggregation parameters ---
 
 /// Absolute minimum area (px²) for an item to render individually (~20x20).
@@ -139,7 +136,7 @@ pub fn build_render_tree(
     root_id: indextree::NodeId,
     container: Rect,
     expansion: &ExpansionState,
-    max_depth: u8,
+    max_depth: usize,
 ) -> Vec<RenderNode> {
     let arena = tree.get_arena();
 

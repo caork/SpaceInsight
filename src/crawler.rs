@@ -6,6 +6,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
+const ABNORMAL_PATH_MARKERS: [&str; 1] = [
+    "/Library/Containers/com.docker.docker/Data/vms",
+];
+
 #[derive(Debug, Clone)]
 pub struct FileNode {
     pub path: PathBuf,
@@ -13,6 +17,7 @@ pub struct FileNode {
     pub is_dir: bool,
 }
 
+#[allow(dead_code)]
 #[derive(Debug)]
 pub struct ScanStats {
     pub total_files: u64,
@@ -54,6 +59,14 @@ impl FileCrawler {
             .parallelism(jwalk::Parallelism::RayonDefaultPool {
                 busy_timeout: std::time::Duration::from_secs(1),
             })
+            .process_read_dir(|_, _, _, children| {
+                children.retain(|entry| {
+                    entry
+                        .as_ref()
+                        .map(|dir_entry| !Self::should_skip_path(&dir_entry.path()))
+                        .unwrap_or(true)
+                });
+            })
             .into_iter()
             .filter_map(|entry| entry.ok())
             .collect();
@@ -61,6 +74,10 @@ impl FileCrawler {
         // Process entries in parallel using rayon
         entries.par_iter().for_each(|entry| {
             let path = entry.path();
+            if Self::should_skip_path(&path) {
+                return;
+            }
+
             let metadata = entry.metadata().ok();
             
             if let Some(meta) = metadata {
@@ -95,6 +112,13 @@ impl FileCrawler {
 
         (nodes, stats)
     }
+
+    fn should_skip_path(path: &Path) -> bool {
+        let normalized = path.to_string_lossy().replace('\\', "/");
+        ABNORMAL_PATH_MARKERS
+            .iter()
+            .any(|marker| normalized.contains(marker))
+    }
 }
 
 impl Default for FileCrawler {
@@ -116,5 +140,16 @@ mod tests {
         assert!(!nodes.is_empty());
         println!("Scanned {} files and {} dirs in {}ms", 
                  stats.total_files, stats.total_dirs, stats.duration_ms);
+    }
+
+    #[test]
+    fn test_skip_abnormal_docker_vm_path() {
+        let docker_vm_file = Path::new(
+            "/Users/demo/Library/Containers/com.docker.docker/Data/vms/0/data/Docker.raw",
+        );
+        let normal_file = Path::new("/Users/demo/Documents/test.txt");
+
+        assert!(FileCrawler::should_skip_path(docker_vm_file));
+        assert!(!FileCrawler::should_skip_path(normal_file));
     }
 }

@@ -266,10 +266,6 @@ impl LayoutAnimator {
         self.is_animating = false;
     }
 
-    /// Check if animator has any states
-    pub fn has_states(&self) -> bool {
-        !self.states.is_empty()
-    }
 }
 
 #[cfg(test)]

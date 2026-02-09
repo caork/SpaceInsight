@@ -6,6 +6,18 @@ use std::f32;
 /// neighboring tiles can overlap.
 pub const MIN_VISIBLE_SIZE: f32 = 16.0;
 
+/// Row growth tolerance: allow a tiny score increase when adding an item,
+/// which helps avoid overly fragmented strip-like rows.
+const ROW_GROWTH_TOLERANCE: f32 = 1.03;
+
+/// Direction scoring weights tuned to prefer near-square tiles while still
+/// keeping future container quality reasonable.
+const WORST_ITEM_WEIGHT: f32 = 1.6;
+const AVG_ITEM_WEIGHT: f32 = 0.7;
+const REMAINING_WEIGHT: f32 = 0.9;
+const STRIP_PENALTY_START: f32 = 5.0;
+const STRIP_PENALTY_WEIGHT: f32 = 2.2;
+
 /// Rectangle structure for treemap layout
 #[derive(Debug, Clone, Copy)]
 pub struct Rect {
@@ -22,10 +34,6 @@ impl Rect {
 
     pub fn area(&self) -> f32 {
         self.width * self.height
-    }
-
-    pub fn short_side(&self) -> f32 {
-        self.width.min(self.height)
     }
 
     pub fn aspect_ratio(&self) -> f32 {
@@ -127,12 +135,12 @@ impl SquarifiedTreemap {
             remaining.remove(0);
             Self::squarify_recursive(remaining, current_row, result, container);
         } else {
-            let current_worst = Self::worst_aspect_ratio(current_row, container);
+            let current_score = Self::best_row_score(current_row, container);
             let mut test_row = current_row.clone();
             test_row.push(next);
-            let test_worst = Self::worst_aspect_ratio(&test_row, container);
+            let test_score = Self::best_row_score(&test_row, container);
 
-            if test_worst <= current_worst {
+            if test_score <= current_score * ROW_GROWTH_TOLERANCE {
                 current_row.push(next);
                 remaining.remove(0);
                 Self::squarify_recursive(remaining, current_row, result, container);
@@ -168,8 +176,24 @@ impl SquarifiedTreemap {
         score_h <= score_v
     }
 
+    /// Score the row by taking the better of horizontal/vertical placement.
+    fn best_row_score(row: &[(usize, f32)], container: Rect) -> f32 {
+        let total: f32 = row.iter().map(|(_, size)| size).sum();
+        if total <= 0.0 || container.width <= 0.0 || container.height <= 0.0 {
+            return f32::INFINITY;
+        }
+
+        let score_h = Self::direction_score(row, container, total, true);
+        let score_v = Self::direction_score(row, container, total, false);
+        score_h.min(score_v)
+    }
+
     /// Score a direction: lower is better.
-    /// Combines worst item aspect ratio + remaining container aspect ratio (weighted 2x).
+    ///
+    /// This favors:
+    /// - low worst/average item aspect ratio (more square-like tiles)
+    /// - reasonable remaining container aspect ratio
+    /// - explicit penalty for extreme strip-like tiles
     fn direction_score(
         row: &[(usize, f32)],
         container: Rect,
@@ -179,43 +203,42 @@ impl SquarifiedTreemap {
         let length = if horizontal { container.width } else { container.height };
         let breadth = if length > 0.0 { total / length } else { 0.0 };
 
-        // Worst aspect ratio of items in this row for this direction
+        // Item aspect stats for this direction
         let mut worst_item = 1.0f32;
+        let mut aspect_sum = 0.0f32;
+        let mut aspect_count = 0.0f32;
+
         for &(_, size) in row {
             let item_len = if total > 0.0 { size / total * length } else { 0.0 };
             if item_len > 0.001 && breadth > 0.001 {
                 let a = item_len.max(breadth) / item_len.min(breadth);
                 worst_item = worst_item.max(a);
+                aspect_sum += a;
+                aspect_count += 1.0;
             }
         }
+
+        let avg_item = if aspect_count > 0.0 {
+            aspect_sum / aspect_count
+        } else {
+            1.0
+        };
 
         // Aspect ratio of the remaining container
         let remaining = Self::compute_remaining(container, total, horizontal);
         let rem_aspect = remaining.aspect_ratio();
         let rem_aspect = if rem_aspect.is_infinite() { 1.0 } else { rem_aspect };
 
-        // Combined score: weight remaining container more heavily because
-        // a bad remaining shape penalizes ALL subsequent items
-        worst_item + 2.0 * rem_aspect
-    }
+        let strip_penalty = if worst_item > STRIP_PENALTY_START {
+            (worst_item - STRIP_PENALTY_START) * STRIP_PENALTY_WEIGHT
+        } else {
+            0.0
+        };
 
-    fn worst_aspect_ratio(row: &[(usize, f32)], container: Rect) -> f32 {
-        if row.is_empty() {
-            return f32::INFINITY;
-        }
-
-        let total: f32 = row.iter().map(|(_, size)| size).sum();
-        let w = container.short_side();
-        let max_size = row.iter().map(|(_, size)| size).fold(0.0f32, |a, &b| a.max(b));
-        let min_size = row
-            .iter()
-            .map(|(_, size)| size)
-            .fold(f32::INFINITY, |a, &b| a.min(b));
-
-        let aspect1 = (w * w * max_size) / (total * total);
-        let aspect2 = (total * total) / (w * w * min_size);
-
-        aspect1.max(aspect2)
+        WORST_ITEM_WEIGHT * worst_item
+            + AVG_ITEM_WEIGHT * avg_item
+            + REMAINING_WEIGHT * rem_aspect
+            + strip_penalty
     }
 
     /// Place items into a row in the given direction.

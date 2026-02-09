@@ -1,8 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-pub const MAX_EXPAND_DEPTH: u8 = 4;
-
 /// Tracks which folders are expanded and to what depth.
 pub struct ExpansionState {
     expanded: HashMap<PathBuf, u8>, // path -> expansion depth
@@ -22,10 +20,10 @@ impl ExpansionState {
         self.expanded.insert(path.to_path_buf(), 1);
     }
 
-    /// Increment expansion depth by 1, capped at MAX_EXPAND_DEPTH (double-click).
+    /// Increment expansion depth by 1 (double-click).
     pub fn deepen(&mut self, path: &Path) {
         let current = self.expanded.get(path).copied().unwrap_or(0);
-        let new_depth = (current + 1).min(MAX_EXPAND_DEPTH);
+        let new_depth = current.saturating_add(1);
         self.expanded.insert(path.to_path_buf(), new_depth);
     }
 
@@ -87,11 +85,11 @@ mod tests {
         state.deepen(&path);
         assert_eq!(state.depth(&path), 2);
 
-        // Should cap at MAX_EXPAND_DEPTH
+        // Should keep increasing (with saturating add at u8 max)
         for _ in 0..10 {
             state.deepen(&path);
         }
-        assert_eq!(state.depth(&path), MAX_EXPAND_DEPTH);
+        assert_eq!(state.depth(&path), 12);
     }
 
     #[test]
