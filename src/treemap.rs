@@ -1,5 +1,8 @@
 use std::f32;
 
+/// Minimum pixel dimension for tiny items
+pub const MIN_VISIBLE_SIZE: f32 = 16.0;
+
 /// Rectangle structure for treemap layout
 #[derive(Debug, Clone, Copy)]
 pub struct Rect {
@@ -21,6 +24,14 @@ impl Rect {
     pub fn short_side(&self) -> f32 {
         self.width.min(self.height)
     }
+
+    pub fn aspect_ratio(&self) -> f32 {
+        if self.width < 1.0 || self.height < 1.0 {
+            f32::INFINITY
+        } else {
+            self.width.max(self.height) / self.width.min(self.height)
+        }
+    }
 }
 
 /// Item to be laid out in the treemap
@@ -35,9 +46,16 @@ pub struct TreemapItem {
 pub struct LayoutRect {
     pub rect: Rect,
     pub index: usize,
+    /// True if item is below minimum visible size threshold
+    pub is_tiny: bool,
 }
 
-/// Squarified Treemap Algorithm (Bruls, Huizing, van Wijk)
+/// Squarified Treemap with adaptive split direction.
+///
+/// Standard squarified treemap always splits along the shorter axis.
+/// This version tries BOTH directions at each row placement and picks
+/// the direction that produces the best-shaped remaining container,
+/// preventing thin strips when a dominant item consumes most of the area.
 pub struct SquarifiedTreemap;
 
 impl SquarifiedTreemap {
@@ -64,7 +82,16 @@ impl SquarifiedTreemap {
 
         let mut result = Vec::with_capacity(items.len());
         Self::squarify(&normalized, &mut result, container);
-        
+
+        // Post-process: clamp tiny items to minimum visible size
+        for lr in &mut result {
+            if lr.rect.width < MIN_VISIBLE_SIZE || lr.rect.height < MIN_VISIBLE_SIZE {
+                lr.is_tiny = true;
+                lr.rect.width = lr.rect.width.max(MIN_VISIBLE_SIZE);
+                lr.rect.height = lr.rect.height.max(MIN_VISIBLE_SIZE);
+            }
+        }
+
         result
     }
 
@@ -75,7 +102,7 @@ impl SquarifiedTreemap {
 
         let mut current_row = Vec::new();
         let mut remaining = items.to_vec();
-        
+
         Self::squarify_recursive(&mut remaining, &mut current_row, result, container);
     }
 
@@ -87,14 +114,15 @@ impl SquarifiedTreemap {
     ) {
         if remaining.is_empty() {
             if !current_row.is_empty() {
-                Self::layout_row(current_row, result, container);
+                // Last row: no remaining items, direction doesn't affect future layout
+                Self::emit_row(current_row, result, container, container.width >= container.height);
                 current_row.clear();
             }
             return;
         }
 
         let next = remaining[0];
-        
+
         if current_row.is_empty() {
             current_row.push(next);
             remaining.remove(0);
@@ -110,14 +138,66 @@ impl SquarifiedTreemap {
                 remaining.remove(0);
                 Self::squarify_recursive(remaining, current_row, result, container);
             } else {
-                // Layout current row and start new row
+                // Finalize this row: pick the best split direction
                 let row_total: f32 = current_row.iter().map(|(_, size)| size).sum();
-                let new_container = Self::get_remaining_rect(&container, row_total);
-                Self::layout_row(current_row, result, container);
+                let horizontal = Self::pick_direction(current_row, container, row_total);
+                let new_container = Self::compute_remaining(container, row_total, horizontal);
+                Self::emit_row(current_row, result, container, horizontal);
                 current_row.clear();
                 Self::squarify_recursive(remaining, current_row, result, new_container);
             }
         }
+    }
+
+    /// Try both split directions, return true for horizontal, false for vertical.
+    /// Picks the direction that gives the best combination of:
+    ///   - aspect ratios of items in the current row
+    ///   - aspect ratio of the remaining container (weighted 2x)
+    fn pick_direction(
+        row: &[(usize, f32)],
+        container: Rect,
+        total: f32,
+    ) -> bool {
+        if total <= 0.0 || container.width <= 0.0 || container.height <= 0.0 {
+            return container.width >= container.height;
+        }
+
+        let score_h = Self::direction_score(row, container, total, true);
+        let score_v = Self::direction_score(row, container, total, false);
+
+        // Lower score is better; prefer horizontal on tie
+        score_h <= score_v
+    }
+
+    /// Score a direction: lower is better.
+    /// Combines worst item aspect ratio + remaining container aspect ratio (weighted 2x).
+    fn direction_score(
+        row: &[(usize, f32)],
+        container: Rect,
+        total: f32,
+        horizontal: bool,
+    ) -> f32 {
+        let length = if horizontal { container.width } else { container.height };
+        let breadth = if length > 0.0 { total / length } else { 0.0 };
+
+        // Worst aspect ratio of items in this row for this direction
+        let mut worst_item = 1.0f32;
+        for &(_, size) in row {
+            let item_len = if total > 0.0 { size / total * length } else { 0.0 };
+            if item_len > 0.001 && breadth > 0.001 {
+                let a = item_len.max(breadth) / item_len.min(breadth);
+                worst_item = worst_item.max(a);
+            }
+        }
+
+        // Aspect ratio of the remaining container
+        let remaining = Self::compute_remaining(container, total, horizontal);
+        let rem_aspect = remaining.aspect_ratio();
+        let rem_aspect = if rem_aspect.is_infinite() { 1.0 } else { rem_aspect };
+
+        // Combined score: weight remaining container more heavily because
+        // a bad remaining shape penalizes ALL subsequent items
+        worst_item + 2.0 * rem_aspect
     }
 
     fn worst_aspect_ratio(row: &[(usize, f32)], container: Rect) -> f32 {
@@ -128,25 +208,33 @@ impl SquarifiedTreemap {
         let total: f32 = row.iter().map(|(_, size)| size).sum();
         let w = container.short_side();
         let max_size = row.iter().map(|(_, size)| size).fold(0.0f32, |a, &b| a.max(b));
-        let min_size = row.iter().map(|(_, size)| size).fold(f32::INFINITY, |a, &b| a.min(b));
+        let min_size = row
+            .iter()
+            .map(|(_, size)| size)
+            .fold(f32::INFINITY, |a, &b| a.min(b));
 
         let aspect1 = (w * w * max_size) / (total * total);
         let aspect2 = (total * total) / (w * w * min_size);
-        
+
         aspect1.max(aspect2)
     }
 
-    fn layout_row(row: &[(usize, f32)], result: &mut Vec<LayoutRect>, container: Rect) {
+    /// Place items into a row in the given direction.
+    fn emit_row(
+        row: &[(usize, f32)],
+        result: &mut Vec<LayoutRect>,
+        container: Rect,
+        horizontal: bool,
+    ) {
         let total: f32 = row.iter().map(|(_, size)| size).sum();
-        
-        let horizontal = container.width >= container.height;
-        let (length, breadth) = if horizontal {
-            (container.width, container.height)
+
+        let length = if horizontal {
+            container.width
         } else {
-            (container.height, container.width)
+            container.height
         };
-        
-        let row_breadth = if total > 0.0 {
+
+        let row_breadth = if total > 0.0 && length > 0.0 {
             total / length
         } else {
             0.0
@@ -162,35 +250,29 @@ impl SquarifiedTreemap {
             };
 
             let rect = if horizontal {
-                Rect::new(
-                    container.x + offset,
-                    container.y,
-                    item_length,
-                    row_breadth,
-                )
+                Rect::new(container.x + offset, container.y, item_length, row_breadth)
             } else {
-                Rect::new(
-                    container.x,
-                    container.y + offset,
-                    row_breadth,
-                    item_length,
-                )
+                Rect::new(container.x, container.y + offset, row_breadth, item_length)
             };
 
-            result.push(LayoutRect { rect, index });
+            result.push(LayoutRect {
+                rect,
+                index,
+                is_tiny: false,
+            });
             offset += item_length;
         }
     }
 
-    fn get_remaining_rect(container: &Rect, row_total: f32) -> Rect {
-        let horizontal = container.width >= container.height;
-        let (length, breadth) = if horizontal {
-            (container.width, container.height)
+    /// Compute the remaining container after placing a row.
+    fn compute_remaining(container: Rect, row_total: f32, horizontal: bool) -> Rect {
+        let length = if horizontal {
+            container.width
         } else {
-            (container.height, container.width)
+            container.height
         };
-        
-        let row_breadth = if row_total > 0.0 {
+
+        let row_breadth = if row_total > 0.0 && length > 0.0 {
             row_total / length
         } else {
             0.0
@@ -201,13 +283,13 @@ impl SquarifiedTreemap {
                 container.x,
                 container.y + row_breadth,
                 container.width,
-                container.height - row_breadth,
+                (container.height - row_breadth).max(0.0),
             )
         } else {
             Rect::new(
                 container.x + row_breadth,
                 container.y,
-                container.width - row_breadth,
+                (container.width - row_breadth).max(0.0),
                 container.height,
             )
         }
@@ -230,10 +312,56 @@ mod tests {
         let layout = SquarifiedTreemap::layout(&items, container);
 
         assert_eq!(layout.len(), 3);
-        // Verify total area is approximately preserved (allowing for floating point errors)
+        // Verify total area is approximately preserved
         let total_area: f32 = layout.iter().map(|r| r.rect.area()).sum();
         let ratio = total_area / container.area();
-        assert!(ratio > 0.99 && ratio < 1.01, 
-                "Total area ratio {} should be close to 1.0", ratio);
+        assert!(
+            ratio > 0.99 && ratio < 1.01,
+            "Total area ratio {} should be close to 1.0",
+            ratio
+        );
+    }
+
+    #[test]
+    fn test_dominant_item_no_thin_strip() {
+        // Simulates the user's case: one huge item + a few small ones
+        let items = vec![
+            TreemapItem { size: 6476, index: 0 }, // "github" ~90%
+            TreemapItem { size: 641, index: 1 },   // "DCIM" ~9%
+            TreemapItem { size: 50, index: 2 },
+            TreemapItem { size: 30, index: 3 },
+        ];
+
+        let container = Rect::new(0.0, 0.0, 1200.0, 780.0);
+        let layout = SquarifiedTreemap::layout(&items, container);
+
+        assert_eq!(layout.len(), 4);
+
+        // All rects should have area > 0
+        for lr in &layout {
+            assert!(lr.rect.area() > 0.0);
+        }
+
+        // The second-largest item (DCIM) should not be excessively thin.
+        // With 90% dominant item, the best achievable DCIM aspect ratio is ~5.8
+        // (constrained by the remaining strip width). This is much better than
+        // the old horizontal-only layout which gave ~17:1.
+        let dcim = layout.iter().find(|lr| lr.index == 1).unwrap();
+        let dcim_aspect = dcim.rect.width.max(dcim.rect.height)
+            / dcim.rect.width.min(dcim.rect.height);
+        assert!(
+            dcim_aspect < 8.0,
+            "DCIM aspect ratio {} is too elongated",
+            dcim_aspect
+        );
+
+        // Total area should still be preserved
+        let total_area: f32 = layout.iter().map(|r| r.rect.area()).sum();
+        let ratio = total_area / container.area();
+        assert!(
+            ratio > 0.99 && ratio < 1.01,
+            "Total area ratio {} should be close to 1.0",
+            ratio
+        );
     }
 }

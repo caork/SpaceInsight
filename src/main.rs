@@ -2,14 +2,21 @@ use eframe::egui;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Instant;
 
+mod animation;
 mod crawler;
+mod expand_state;
+mod render_tree;
 mod tree;
 mod treemap;
 
+use animation::LayoutAnimator;
 use crawler::{FileCrawler, ScanStats};
+use expand_state::ExpansionState;
+use render_tree::{build_render_tree, RenderNode, BORDER_VISUAL_WIDTH, HEADER_HEIGHT, SIDE_INSET};
 use tree::FileTree;
-use treemap::{SquarifiedTreemap, Rect, TreemapItem, LayoutRect};
+use treemap::{Rect, SquarifiedTreemap, TreemapItem};
 
 fn main() -> Result<(), eframe::Error> {
     let options = eframe::NativeOptions {
@@ -23,7 +30,6 @@ fn main() -> Result<(), eframe::Error> {
         "SpaceInsight",
         options,
         Box::new(|cc| {
-            // Configure custom visuals for Apple-inspired aesthetic
             configure_custom_style(&cc.egui_ctx);
             Box::new(SpaceInsightApp::default())
         }),
@@ -32,51 +38,67 @@ fn main() -> Result<(), eframe::Error> {
 
 fn configure_custom_style(ctx: &egui::Context) {
     let mut style = (*ctx.style()).clone();
-    
-    // Dark theme with deep slate background
+
     let mut visuals = egui::Visuals::dark();
-    
-    // Aurora gradient colors (will be rendered manually in background)
+
     visuals.panel_fill = egui::Color32::from_rgba_unmultiplied(30, 41, 59, 240);
     visuals.window_fill = egui::Color32::from_rgba_unmultiplied(30, 41, 59, 230);
-    
-    // Glass morphism - subtle borders
-    visuals.window_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 26));
-    visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 13));
-    
-    // Rounded corners (squircles)
+
+    visuals.window_stroke =
+        egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 26));
+    visuals.widgets.noninteractive.bg_stroke =
+        egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 13));
+
     visuals.window_rounding = egui::Rounding::same(12.0);
     visuals.widgets.noninteractive.rounding = egui::Rounding::same(8.0);
     visuals.widgets.inactive.rounding = egui::Rounding::same(8.0);
     visuals.widgets.hovered.rounding = egui::Rounding::same(8.0);
     visuals.widgets.active.rounding = egui::Rounding::same(8.0);
-    
-    // Shadows for depth (using default shadow)
+
     visuals.window_shadow = egui::epaint::Shadow::NONE;
-    
+
     style.visuals = visuals;
-    
-    // Typography - spacing and sizing
+
     style.spacing.item_spacing = egui::vec2(12.0, 8.0);
     style.spacing.window_margin = egui::Margin::same(24.0);
     style.spacing.button_padding = egui::vec2(16.0, 8.0);
-    
+
     ctx.set_style(style);
+}
+
+/// Actions resulting from user clicks in the treemap.
+enum ClickAction {
+    Expand(PathBuf),
+    Deepen(PathBuf),
+    Collapse(PathBuf),
+    SelectFile(PathBuf),
 }
 
 struct SpaceInsightApp {
     scan_path: String,
     is_scanning: bool,
     scan_result: Arc<Mutex<Option<ScanResult>>>,
-    layout: Vec<LayoutRect>,
-    tree_items: Vec<TreeItem>,
     has_data: bool,
-    // Navigation state
     file_tree: Option<FileTree>,
-    current_view: Option<indextree::NodeId>,
-    navigation_stack: Vec<PathBuf>,
-    // Animation state
-    hovered_index: Option<usize>,
+    root_node_id: Option<indextree::NodeId>,
+    expansion_state: ExpansionState,
+    render_nodes: Vec<RenderNode>,
+    hovered_path: Option<PathBuf>,
+    selected_path: Option<PathBuf>,
+    // Animation state (initial scan reveal only)
+    animator: LayoutAnimator,
+    last_frame_time: Option<Instant>,
+    last_container_rect: Option<egui::Rect>,
+    // Cached top-level items for animation
+    top_level_items: Vec<TopLevelItem>,
+}
+
+#[derive(Clone)]
+struct TopLevelItem {
+    path: PathBuf,
+    name: String,
+    size: u64,
+    is_dir: bool,
 }
 
 impl Default for SpaceInsightApp {
@@ -85,13 +107,17 @@ impl Default for SpaceInsightApp {
             scan_path: String::default(),
             is_scanning: false,
             scan_result: Arc::new(Mutex::new(None)),
-            layout: Vec::new(),
-            tree_items: Vec::new(),
             has_data: false,
             file_tree: None,
-            current_view: None,
-            navigation_stack: Vec::new(),
-            hovered_index: None,
+            root_node_id: None,
+            expansion_state: ExpansionState::default(),
+            render_nodes: Vec::new(),
+            hovered_path: None,
+            selected_path: None,
+            animator: LayoutAnimator::default(),
+            last_frame_time: None,
+            last_container_rect: None,
+            top_level_items: Vec::new(),
         }
     }
 }
@@ -100,14 +126,6 @@ struct ScanResult {
     tree: FileTree,
     #[allow(dead_code)]
     stats: ScanStats,
-}
-
-#[derive(Clone, Debug)]
-struct TreeItem {
-    path: PathBuf,
-    name: String,
-    size: u64,
-    is_dir: bool,
 }
 
 impl SpaceInsightApp {
@@ -129,12 +147,8 @@ impl SpaceInsightApp {
             let mut crawler = FileCrawler::new();
             let (nodes, stats) = crawler.scan(&path);
 
-            println!("Crawler found {} nodes", nodes.len());
-
-            // Build tree
             let mut tree = FileTree::new(&path);
-            
-            // Sort paths to ensure parents are added before children
+
             let mut paths: Vec<_> = nodes.iter().map(|entry| entry.key().clone()).collect();
             paths.sort();
 
@@ -147,28 +161,20 @@ impl SpaceInsightApp {
             }
 
             tree.calculate_sizes();
-            
-            let root_id = tree.get_root();
-            let arena = tree.get_arena();
-            let child_count = root_id.children(arena).count();
-            println!("Tree built! Root has {} children, total size: {}", child_count, tree.total_size());
 
-            let result = ScanResult { tree, stats };
-            
-            *scan_result.lock().unwrap() = Some(result);
+            *scan_result.lock().unwrap() = Some(ScanResult { tree, stats });
         });
     }
 
-    fn update_layout(&mut self, container_rect: egui::Rect) {
+    fn check_scan_result(&mut self, container_rect: egui::Rect) {
         let scan_complete = if let Ok(mut result_guard) = self.scan_result.try_lock() {
             if let Some(result) = result_guard.take() {
                 self.is_scanning = false;
-                
                 let root = result.tree.get_root();
-                self.current_view = Some(root);
+                self.root_node_id = Some(root);
                 self.file_tree = Some(result.tree);
-                self.navigation_stack.clear();
-                
+                self.expansion_state = ExpansionState::default();
+                self.selected_path = None;
                 true
             } else {
                 false
@@ -176,44 +182,38 @@ impl SpaceInsightApp {
         } else {
             false
         };
-        
+
         if scan_complete {
-            self.populate_current_view();
-            println!("Scan completed! Found {} items", self.tree_items.len());
-            self.has_data = !self.tree_items.is_empty();
+            self.has_data = true;
+            self.populate_top_level_items();
+            self.start_initial_animation(container_rect);
         }
-        
-        if self.has_data && !self.tree_items.is_empty() {
-            let items: Vec<TreemapItem> = self.tree_items
-                .iter()
-                .enumerate()
-                .map(|(i, item)| TreemapItem {
-                    size: item.size,
-                    index: i,
-                })
-                .collect();
 
-            let container = Rect::new(
-                container_rect.min.x,
-                container_rect.min.y,
-                container_rect.width(),
-                container_rect.height(),
-            );
-
-            self.layout = SquarifiedTreemap::layout(&items, container);
+        // Recompute render tree if container size changed
+        if self.has_data && !self.animator.is_animating {
+            let needs_recompute = match self.last_container_rect {
+                Some(prev) => {
+                    (prev.width() - container_rect.width()).abs() > 1.0
+                        || (prev.height() - container_rect.height()).abs() > 1.0
+                        || (prev.min.x - container_rect.min.x).abs() > 1.0
+                        || (prev.min.y - container_rect.min.y).abs() > 1.0
+                }
+                None => true,
+            };
+            if needs_recompute {
+                self.rebuild_render_tree(container_rect);
+            }
         }
     }
 
-    fn populate_current_view(&mut self) {
-        self.tree_items.clear();
-        
-        if let (Some(tree), Some(current_id)) = (&self.file_tree, self.current_view) {
+    fn populate_top_level_items(&mut self) {
+        self.top_level_items.clear();
+        if let (Some(tree), Some(root_id)) = (&self.file_tree, self.root_node_id) {
             let arena = tree.get_arena();
-            
-            for child_id in current_id.children(arena) {
+            for child_id in root_id.children(arena) {
                 if let Some(node) = arena.get(child_id) {
                     let data = node.get();
-                    self.tree_items.push(TreeItem {
+                    self.top_level_items.push(TopLevelItem {
                         path: data.path.clone(),
                         name: data.name.clone(),
                         size: data.cumulative_size,
@@ -224,30 +224,56 @@ impl SpaceInsightApp {
         }
     }
 
-    fn navigate_to(&mut self, path: &PathBuf) {
-        if let Some(tree) = &self.file_tree {
-            if let Some(node_id) = tree.get_node(path) {
-                if let Some(current_id) = self.current_view {
-                    if let Some(current_node) = tree.get_arena().get(current_id) {
-                        self.navigation_stack.push(current_node.get().path.clone());
-                    }
-                }
-                
-                self.current_view = Some(node_id);
-                self.populate_current_view();
-            }
+    fn start_initial_animation(&mut self, container_rect: egui::Rect) {
+        self.last_container_rect = Some(container_rect);
+
+        let padded = Self::padded_container(container_rect);
+
+        let items: Vec<TreemapItem> = self
+            .top_level_items
+            .iter()
+            .enumerate()
+            .map(|(i, item)| TreemapItem {
+                size: item.size,
+                index: i,
+            })
+            .collect();
+
+        let container = Rect::new(padded.min.x, padded.min.y, padded.width(), padded.height());
+        let layout = SquarifiedTreemap::layout(&items, container);
+
+        let targets: Vec<(f32, f32, f32, f32, usize)> = layout
+            .iter()
+            .map(|lr| (lr.rect.x, lr.rect.y, lr.rect.width, lr.rect.height, lr.index))
+            .collect();
+
+        let center = (padded.center().x, padded.center().y);
+        let item_count = self.top_level_items.len();
+        self.animator.start(&targets, center, item_count);
+    }
+
+    fn rebuild_render_tree(&mut self, container_rect: egui::Rect) {
+        self.last_container_rect = Some(container_rect);
+
+        if let (Some(tree), Some(root_id)) = (&self.file_tree, self.root_node_id) {
+            let padded = Self::padded_container(container_rect);
+            let container = Rect::new(padded.min.x, padded.min.y, padded.width(), padded.height());
+
+            self.render_nodes = build_render_tree(
+                tree,
+                root_id,
+                container,
+                &self.expansion_state,
+                render_tree::MAX_EXPAND_DEPTH,
+            );
         }
     }
 
-    fn navigate_back(&mut self) {
-        if let Some(previous_path) = self.navigation_stack.pop() {
-            if let Some(tree) = &self.file_tree {
-                if let Some(node_id) = tree.get_node(&previous_path) {
-                    self.current_view = Some(node_id);
-                    self.populate_current_view();
-                }
-            }
-        }
+    fn padded_container(rect: egui::Rect) -> egui::Rect {
+        egui::Rect::from_min_size(
+            egui::pos2(rect.min.x + 4.0, rect.min.y + 4.0),
+            egui::vec2((rect.width() - 8.0).max(1.0), (rect.height() - 8.0).max(1.0)),
+        )
     }
 
     fn format_size(size: u64) -> String {
@@ -266,27 +292,26 @@ impl SpaceInsightApp {
         }
     }
 
-    /// Temperature-based color palette: cool blues → warm amber → energetic coral
     fn get_temperature_color(size_ratio: f32, is_hovered: bool) -> egui::Color32 {
         let (r, g, b) = if size_ratio < 0.15 {
-            // Cool blue range for small files
             let t = size_ratio / 0.15;
             (59.0 + 80.0 * t, 130.0 + 35.0 * t, 246.0)
         } else if size_ratio < 0.4 {
-            // Purple range for medium files
             (139.0, 92.0, 246.0)
         } else if size_ratio < 0.7 {
-            // Amber range for large files
             let t = (size_ratio - 0.4) / 0.3;
             (245.0 + 6.0 * t, 158.0 + 33.0 * t, 11.0 + 25.0 * t)
         } else {
-            // Coral range for very large files
             let t = (size_ratio - 0.7) / 0.3;
             (239.0 + 9.0 * t, 68.0 + 45.0 * t, 68.0 + 45.0 * t)
         };
 
         let (r, g, b) = if is_hovered {
-            ((r * 1.15).min(255.0), (g * 1.15).min(255.0), (b * 1.15).min(255.0))
+            (
+                (r * 1.15).min(255.0),
+                (g * 1.15).min(255.0),
+                (b * 1.15).min(255.0),
+            )
         } else {
             (r, g, b)
         };
@@ -294,30 +319,21 @@ impl SpaceInsightApp {
         egui::Color32::from_rgb(r as u8, g as u8, b as u8)
     }
 
-    /// Draw aurora gradient background that shifts with folder depth
-    fn draw_aurora_background(&self, painter: &egui::Painter, rect: egui::Rect) {
-        let depth = self.navigation_stack.len() as f32;
-        let depth_factor = (depth * 0.1).min(0.3);
-        
-        let top_color = egui::Color32::from_rgb(
-            (30.0 - depth_factor * 10.0) as u8,
-            (41.0 + depth_factor * 35.0) as u8,
-            (59.0 + depth_factor * 59.0) as u8,
-        );
-        
-        let bottom_color = egui::Color32::from_rgb(
-            (15.0 - depth_factor * 5.0) as u8,
-            (118.0 - depth_factor * 20.0) as u8,
-            (110.0 + depth_factor * 8.0) as u8,
-        );
-        
+    fn draw_aurora_background(painter: &egui::Painter, rect: egui::Rect) {
+        let top_color = egui::Color32::from_rgb(30, 41, 59);
+        let bottom_color = egui::Color32::from_rgb(15, 118, 110);
+
         let mesh = Self::create_gradient_mesh(rect, top_color, bottom_color);
         painter.add(egui::Shape::Mesh(mesh));
     }
-    
-    fn create_gradient_mesh(rect: egui::Rect, top_color: egui::Color32, bottom_color: egui::Color32) -> egui::Mesh {
+
+    fn create_gradient_mesh(
+        rect: egui::Rect,
+        top_color: egui::Color32,
+        bottom_color: egui::Color32,
+    ) -> egui::Mesh {
         let mut mesh = egui::Mesh::default();
-        
+
         mesh.vertices.push(egui::epaint::Vertex {
             pos: rect.left_top(),
             uv: egui::pos2(0.0, 0.0),
@@ -338,114 +354,184 @@ impl SpaceInsightApp {
             uv: egui::pos2(0.0, 1.0),
             color: bottom_color,
         });
-        
+
         mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
-        
+
         mesh
     }
-}
 
-impl eframe::App for SpaceInsightApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.heading("SpaceInsight");
-                ui.separator();
-                
-                ui.label("Path:");
-                ui.text_edit_singleline(&mut self.scan_path);
-                
-                if ui.button("Scan").clicked() {
-                    self.start_scan();
+    /// Recursively render nodes and collect any click action.
+    fn render_nodes_recursive(
+        nodes: &[RenderNode],
+        ui: &mut egui::Ui,
+        painter: &egui::Painter,
+        total_size: u64,
+        selected_path: &Option<PathBuf>,
+        hovered_path: &mut Option<PathBuf>,
+        min_label_area: f32,
+    ) -> Option<ClickAction> {
+        let mut action: Option<ClickAction> = None;
+
+        for node in nodes {
+            let is_expanded = node.content_rect.is_some();
+
+            if is_expanded {
+                // --- Expanded folder ---
+                let outer = egui::Rect::from_min_size(
+                    egui::pos2(node.outer_rect.x, node.outer_rect.y),
+                    egui::vec2(node.outer_rect.width, node.outer_rect.height),
+                );
+
+                // Dimmed background fill with thin border
+                painter.rect(
+                    outer,
+                    4.0,
+                    egui::Color32::from_rgba_unmultiplied(20, 30, 45, 160),
+                    egui::Stroke::new(
+                        BORDER_VISUAL_WIDTH,
+                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 40),
+                    ),
+                );
+
+                // Header bar background (subtle highlight)
+                let header_rect = egui::Rect::from_min_size(
+                    outer.left_top(),
+                    egui::vec2(outer.width(), HEADER_HEIGHT),
+                );
+                painter.rect(
+                    header_rect,
+                    egui::Rounding { nw: 4.0, ne: 4.0, sw: 0.0, se: 0.0 },
+                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 15),
+                    egui::Stroke::NONE,
+                );
+
+                // Folder name label in the header
+                let label_y = outer.min.y + HEADER_HEIGHT * 0.5;
+                painter.text(
+                    egui::pos2(outer.min.x + SIDE_INSET + 4.0, label_y),
+                    egui::Align2::LEFT_CENTER,
+                    &node.name,
+                    egui::FontId::proportional(11.0),
+                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 180),
+                );
+
+                // Collapse hit zone: only the header strip
+                let header_id = egui::Id::new(node.stable_id).with("header");
+                let header_response = ui.interact(header_rect, header_id, egui::Sense::click());
+                if header_response.hovered() {
+                    *hovered_path = Some(node.path.clone());
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                 }
-                
-                if self.is_scanning {
-                    ui.spinner();
-                    ui.label("Scanning...");
+                if header_response.clicked() && action.is_none() {
+                    action = Some(ClickAction::Collapse(node.path.clone()));
                 }
-                
-                if self.has_data {
-                    ui.label(format!("Items: {}", self.tree_items.len()));
-                }
-            });
-            
-            // Breadcrumb navigation
-            if self.has_data && self.file_tree.is_some() {
-                ui.horizontal(|ui| {
-                    if !self.navigation_stack.is_empty() {
-                        if ui.button("⬅ Back").clicked() {
-                            self.navigate_back();
+
+                // Recursively render children inside content_rect
+                if !node.children.is_empty() {
+                    if let Some(sub_action) = Self::render_nodes_recursive(
+                        &node.children,
+                        ui,
+                        painter,
+                        total_size,
+                        selected_path,
+                        hovered_path,
+                        min_label_area,
+                    ) {
+                        if action.is_none() {
+                            action = Some(sub_action);
                         }
                     }
-                    
-                    ui.separator();
-                    
-                    if let (Some(tree), Some(current_id)) = (&self.file_tree, self.current_view) {
-                        if let Some(node) = tree.get_arena().get(current_id) {
-                            let current_path = &node.get().path;
-                            ui.label("📁");
-                            ui.label(format!("{}", current_path.display()));
+                }
+            } else {
+                // --- Collapsed / leaf node ---
+                let gutter = 2.0;
+                let px = node.outer_rect.x + gutter;
+                let py = node.outer_rect.y + gutter;
+                let pw = (node.outer_rect.width - 2.0 * gutter).max(1.0);
+                let ph = (node.outer_rect.height - 2.0 * gutter).max(1.0);
+
+                let egui_rect = egui::Rect::from_min_size(
+                    egui::pos2(px, py),
+                    egui::vec2(pw, ph),
+                );
+
+                let node_id = egui::Id::new(node.stable_id);
+                let response = ui.interact(egui_rect, node_id, egui::Sense::click());
+                let is_hovered = response.hovered();
+
+                if is_hovered {
+                    *hovered_path = Some(node.path.clone());
+                    if node.is_dir {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
+                }
+
+                // Click handling (no click action for aggregate blocks)
+                if action.is_none() && !node.is_aggregate {
+                    if response.double_clicked() && node.is_dir {
+                        action = Some(ClickAction::Deepen(node.path.clone()));
+                    } else if response.clicked() {
+                        if node.is_dir {
+                            action = Some(ClickAction::Expand(node.path.clone()));
+                        } else {
+                            action = Some(ClickAction::SelectFile(node.path.clone()));
                         }
                     }
-                });
-            }
-        });
+                }
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            let available_rect = ui.available_rect_before_wrap();
-            
-            self.update_layout(available_rect);
+                let corner_radius = (pw.min(ph) * 0.08).min(12.0);
 
-            let painter = ui.painter();
-            
-            // Draw aurora gradient background
-            self.draw_aurora_background(painter, available_rect);
-            
-            let mut clicked_path: Option<PathBuf> = None;
-            let mut new_hovered_index: Option<usize> = None;
-            let total_size: u64 = self.tree_items.iter().map(|i| i.size).sum();
-            
-            for (idx, layout_rect) in self.layout.iter().enumerate() {
-                if layout_rect.index < self.tree_items.len() {
-                    let item = &self.tree_items[layout_rect.index];
-                    let rect = layout_rect.rect;
-                    
-                    // Add padding between rectangles for breathing room
-                    let padded_rect = Rect::new(
-                        rect.x + 2.0,
-                        rect.y + 2.0,
-                        (rect.width - 4.0).max(1.0),
-                        (rect.height - 4.0).max(1.0),
+                if node.is_aggregate {
+                    // --- Aggregate block: grey ---
+                    let grey = if is_hovered {
+                        egui::Color32::from_rgb(90, 95, 105)
+                    } else {
+                        egui::Color32::from_rgb(70, 75, 85)
+                    };
+                    painter.rect(egui_rect, corner_radius, grey, egui::Stroke::NONE);
+                    painter.rect_stroke(
+                        egui_rect,
+                        corner_radius,
+                        egui::Stroke::new(
+                            1.0,
+                            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 20),
+                        ),
                     );
-                    
-                    let egui_rect = egui::Rect::from_min_size(
-                        egui::pos2(padded_rect.x, padded_rect.y),
-                        egui::vec2(padded_rect.width, padded_rect.height),
-                    );
 
-                    let response = ui.interact(egui_rect, ui.id().with(idx), egui::Sense::click());
-                    let is_hovered = response.hovered();
-                    
-                    if is_hovered {
-                        new_hovered_index = Some(idx);
-                        if item.is_dir {
-                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                        }
+                    let area = pw * ph;
+                    if area > min_label_area {
+                        painter.text(
+                            egui::pos2(egui_rect.center().x, egui_rect.center().y - 8.0),
+                            egui::Align2::CENTER_CENTER,
+                            &node.name,
+                            egui::FontId::proportional(11.0),
+                            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 140),
+                        );
+                        painter.text(
+                            egui::pos2(egui_rect.center().x, egui_rect.center().y + 8.0),
+                            egui::Align2::CENTER_CENTER,
+                            Self::format_size(node.size),
+                            egui::FontId::proportional(10.0),
+                            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 100),
+                        );
+                    } else if is_hovered {
+                        response.on_hover_text(format!(
+                            "{} ({})",
+                            node.name,
+                            Self::format_size(node.size)
+                        ));
                     }
-                    
-                    if response.clicked() && item.is_dir {
-                        clicked_path = Some(item.path.clone());
-                    }
-
+                } else {
+                    // --- Normal file/folder block ---
                     let size_ratio = if total_size > 0 {
-                        item.size as f32 / total_size as f32
+                        node.size as f32 / total_size as f32
                     } else {
                         0.0
                     };
-                    
-                    let color = Self::get_temperature_color(size_ratio, is_hovered);
-                    
-                    // Draw shadow for depth
+
+                    let base_color = Self::get_temperature_color(size_ratio, is_hovered);
+
+                    // Shadow
                     let shadow_rect = egui_rect.translate(egui::vec2(0.0, 2.0));
                     painter.rect(
                         shadow_rect,
@@ -454,43 +540,62 @@ impl eframe::App for SpaceInsightApp {
                         egui::Stroke::NONE,
                     );
 
-                    // Draw main rectangle with rounded corners (squircles)
-                    let corner_radius = (padded_rect.width.min(padded_rect.height) * 0.08).min(12.0);
-                    painter.rect(
-                        egui_rect,
-                        corner_radius,
-                        color,
-                        egui::Stroke::NONE,
-                    );
-                    
-                    // Glass morphism border
-                    painter.rect_stroke(
-                        egui_rect,
-                        corner_radius,
-                        egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 30)),
-                    );
+                    // Main fill
+                    painter.rect(egui_rect, corner_radius, base_color, egui::Stroke::NONE);
 
-                    // Smart label placement - only show if enough space
-                    let min_label_area = 2500.0;
-                    if padded_rect.width * padded_rect.height > min_label_area {
-                        let dir_indicator = if item.is_dir { "📁" } else { "📄" };
-                        
-                        let (name_size, size_size) = if padded_rect.width * padded_rect.height > 10000.0 {
+                    // Border
+                    let border_stroke = if node.is_dir {
+                        egui::Stroke::new(
+                            1.5,
+                            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 50),
+                        )
+                    } else {
+                        egui::Stroke::new(
+                            1.0,
+                            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 30),
+                        )
+                    };
+                    painter.rect_stroke(egui_rect, corner_radius, border_stroke);
+
+                    // Selection glow
+                    if selected_path.as_ref() == Some(&node.path) && !node.is_dir {
+                        let glow_rect = egui_rect.expand(2.0);
+                        painter.rect_stroke(
+                            glow_rect,
+                            corner_radius + 2.0,
+                            egui::Stroke::new(
+                                2.0,
+                                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 100),
+                            ),
+                        );
+                    }
+
+                    // Labels
+                    let area = pw * ph;
+                    if area > min_label_area {
+                        let dir_indicator = if node.is_dir { "+" } else { "" };
+
+                        let (name_size, size_size) = if area > 10000.0 {
                             (14.0, 11.0)
                         } else {
                             (12.0, 10.0)
                         };
-                        
-                        let name_text = format!("{} {}", dir_indicator, item.name);
+
+                        let name_text = if node.is_dir {
+                            format!("{} {}", dir_indicator, node.name)
+                        } else {
+                            node.name.clone()
+                        };
+
                         painter.text(
                             egui::pos2(egui_rect.center().x, egui_rect.center().y - 8.0),
                             egui::Align2::CENTER_CENTER,
                             name_text,
                             egui::FontId::proportional(name_size),
-                            egui::Color32::WHITE,
+                            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 255),
                         );
-                        
-                        let size_text = Self::format_size(item.size);
+
+                        let size_text = Self::format_size(node.size);
                         painter.text(
                             egui::pos2(egui_rect.center().x, egui_rect.center().y + 8.0),
                             egui::Align2::CENTER_CENTER,
@@ -498,17 +603,287 @@ impl eframe::App for SpaceInsightApp {
                             egui::FontId::proportional(size_size),
                             egui::Color32::from_rgba_unmultiplied(255, 255, 255, 153),
                         );
+                    } else if is_hovered {
+                        let dir_indicator = if node.is_dir { "+" } else { "" };
+                        let tooltip_text = format!(
+                            "{} {} ({})",
+                            dir_indicator,
+                            node.name,
+                            Self::format_size(node.size)
+                        );
+                        response.on_hover_text(tooltip_text);
                     }
                 }
             }
-            
-            self.hovered_index = new_hovered_index;
-            
-            if let Some(path) = clicked_path {
-                self.navigate_to(&path);
+        }
+
+        action
+    }
+
+    /// Render the initial animation (top-level only, no expand until done).
+    fn render_initial_animation(
+        &self,
+        ui: &mut egui::Ui,
+        painter: &egui::Painter,
+    ) {
+        let anim_rects = self.animator.get_animated_rects();
+        let total_size: u64 = self.top_level_items.iter().map(|i| i.size).sum();
+        let min_label_area = self.animator.tier.min_label_area();
+
+        for anim in anim_rects {
+            if !anim.is_revealed {
+                continue;
             }
 
-            if self.is_scanning {
+            let item_index = anim.index;
+            if item_index >= self.top_level_items.len() {
+                continue;
+            }
+
+            let item = &self.top_level_items[item_index];
+            let opacity = anim.current.opacity;
+
+            let px = anim.current.x + 2.0;
+            let py = anim.current.y + 2.0;
+            let pw = (anim.current.w - 4.0).max(1.0);
+            let ph = (anim.current.h - 4.0).max(1.0);
+
+            let egui_rect =
+                egui::Rect::from_min_size(egui::pos2(px, py), egui::vec2(pw, ph));
+
+            let size_ratio = if total_size > 0 {
+                item.size as f32 / total_size as f32
+            } else {
+                0.0
+            };
+
+            let base_color = Self::get_temperature_color(size_ratio, false);
+            let alpha = (opacity * 255.0) as u8;
+            let color = egui::Color32::from_rgba_unmultiplied(
+                base_color.r(),
+                base_color.g(),
+                base_color.b(),
+                alpha,
+            );
+
+            if opacity > 0.3 {
+                let shadow_rect = egui_rect.translate(egui::vec2(0.0, 2.0));
+                painter.rect(
+                    shadow_rect,
+                    10.0,
+                    egui::Color32::from_rgba_unmultiplied(0, 0, 0, (25.0 * opacity) as u8),
+                    egui::Stroke::NONE,
+                );
+            }
+
+            let corner_radius = (pw.min(ph) * 0.08).min(12.0);
+            painter.rect(egui_rect, corner_radius, color, egui::Stroke::NONE);
+
+            let border_stroke = if item.is_dir {
+                egui::Stroke::new(
+                    1.5,
+                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, (50.0 * opacity) as u8),
+                )
+            } else {
+                egui::Stroke::new(
+                    1.0,
+                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, (30.0 * opacity) as u8),
+                )
+            };
+            painter.rect_stroke(egui_rect, corner_radius, border_stroke);
+
+            let area = pw * ph;
+            if area > min_label_area && opacity > 0.5 {
+                let dir_indicator = if item.is_dir { "+" } else { "" };
+                let (name_size, size_size) = if area > 10000.0 {
+                    (14.0, 11.0)
+                } else {
+                    (12.0, 10.0)
+                };
+
+                let label_alpha = (opacity * 255.0) as u8;
+                let name_text = if item.is_dir {
+                    format!("{} {}", dir_indicator, item.name)
+                } else {
+                    item.name.clone()
+                };
+                painter.text(
+                    egui::pos2(egui_rect.center().x, egui_rect.center().y - 8.0),
+                    egui::Align2::CENTER_CENTER,
+                    name_text,
+                    egui::FontId::proportional(name_size),
+                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, label_alpha),
+                );
+
+                let size_text = Self::format_size(item.size);
+                painter.text(
+                    egui::pos2(egui_rect.center().x, egui_rect.center().y + 8.0),
+                    egui::Align2::CENTER_CENTER,
+                    size_text,
+                    egui::FontId::proportional(size_size),
+                    egui::Color32::from_rgba_unmultiplied(
+                        255,
+                        255,
+                        255,
+                        ((153.0 / 255.0) * opacity * 255.0) as u8,
+                    ),
+                );
+            }
+
+            // Hover during animation → snap to final
+            let response = ui.interact(
+                egui_rect,
+                ui.id().with("anim").with(item_index),
+                egui::Sense::hover(),
+            );
+            if response.hovered() {
+                // We'll check after the loop
+            }
+        }
+    }
+}
+
+impl eframe::App for SpaceInsightApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Calculate dt for animation
+        let now = Instant::now();
+        let dt = self
+            .last_frame_time
+            .map(|t| now.duration_since(t).as_secs_f32())
+            .unwrap_or(1.0 / 60.0);
+        self.last_frame_time = Some(now);
+
+        // Update animation
+        let still_animating = self.animator.update(dt);
+
+        // If animation just finished, build the render tree
+        let animation_just_finished = !still_animating && !self.animator.is_animating && self.has_data && self.render_nodes.is_empty();
+
+        egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.heading("SpaceInsight");
+                ui.separator();
+
+                ui.label("Path:");
+                ui.text_edit_singleline(&mut self.scan_path);
+
+                if ui.button("Scan").clicked() {
+                    self.start_scan();
+                }
+
+                if self.is_scanning {
+                    ui.spinner();
+                    ui.label("Scanning...");
+                }
+
+                if self.has_data {
+                    if ui.button("Collapse All").clicked() {
+                        self.expansion_state.collapse_all();
+                        if let Some(rect) = self.last_container_rect {
+                            self.rebuild_render_tree(rect);
+                        }
+                    }
+                }
+            });
+
+            // Show root path and hovered item
+            if self.has_data {
+                ui.horizontal(|ui| {
+                    ui.label(format!("Root: {}", if self.scan_path.is_empty() { "." } else { &self.scan_path }));
+                    if let Some(ref hovered) = self.hovered_path {
+                        ui.separator();
+                        ui.label(format!("{}", hovered.display()));
+                    }
+                });
+            }
+        });
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            let available_rect = ui.available_rect_before_wrap();
+
+            self.check_scan_result(available_rect);
+
+            if animation_just_finished {
+                self.rebuild_render_tree(available_rect);
+            }
+
+            let painter = ui.painter().clone();
+
+            Self::draw_aurora_background(&painter, available_rect);
+
+            let mut new_hovered_path: Option<PathBuf> = None;
+
+            if self.animator.is_animating {
+                // During initial animation, render animated top-level blocks
+                self.render_initial_animation(ui, &painter);
+
+                // Check if user is hovering → snap animation
+                let pointer = ui.input(|i| i.pointer.hover_pos());
+                if let Some(_pos) = pointer {
+                    // Check if pointer is within the treemap area
+                    if available_rect.contains(_pos) && ui.input(|i| i.pointer.any_down()) {
+                        self.animator.finish_immediately();
+                        self.rebuild_render_tree(available_rect);
+                    }
+                }
+            } else if !self.render_nodes.is_empty() {
+                // Normal recursive rendering
+                let total_size = if let Some(tree) = &self.file_tree {
+                    tree.total_size()
+                } else {
+                    0
+                };
+                let min_label_area = self.animator.tier.min_label_area();
+
+                let action = Self::render_nodes_recursive(
+                    &self.render_nodes,
+                    ui,
+                    &painter,
+                    total_size,
+                    &self.selected_path,
+                    &mut new_hovered_path,
+                    min_label_area,
+                );
+
+                // Process click action
+                if let Some(act) = action {
+                    match act {
+                        ClickAction::Expand(path) => {
+                            self.expansion_state.expand(&path);
+                            self.rebuild_render_tree(available_rect);
+                        }
+                        ClickAction::Deepen(path) => {
+                            // Double-click: expand this folder AND its child folders
+                            self.expansion_state.expand(&path);
+                            if let Some(tree) = &self.file_tree {
+                                if let Some(node_id) = tree.get_node(&path) {
+                                    let arena = tree.get_arena();
+                                    for child_id in node_id.children(arena) {
+                                        if let Some(child_node) = arena.get(child_id) {
+                                            let child_data = child_node.get();
+                                            if child_data.is_dir {
+                                                self.expansion_state.expand(&child_data.path);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            self.rebuild_render_tree(available_rect);
+                        }
+                        ClickAction::Collapse(path) => {
+                            self.expansion_state.collapse_recursive(&path);
+                            self.rebuild_render_tree(available_rect);
+                        }
+                        ClickAction::SelectFile(path) => {
+                            self.selected_path = Some(path);
+                        }
+                    }
+                }
+            }
+
+            self.hovered_path = new_hovered_path;
+
+            if self.is_scanning || still_animating || self.animator.is_animating {
                 ctx.request_repaint();
             }
         });
