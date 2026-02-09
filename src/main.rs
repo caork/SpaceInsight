@@ -427,9 +427,9 @@ impl SpaceInsightApp {
         };
 
         let sensitivity = AUTO_JUMP_SENSITIVITY;
-        let hidden_threshold = 0.92 - 0.45 * sensitivity;
-        let pressure_threshold = 1.55 - 0.7 * sensitivity;
-        let visible_min_needed = if sensitivity < 0.35 { 3 } else { 2 };
+        let hidden_threshold = 0.96 - 0.3 * sensitivity;
+        let pressure_threshold = 2.2 - 0.9 * sensitivity;
+        let visible_min_needed = if sensitivity < 0.35 { 2 } else { 1 };
         let area_pressure = if avg_renderable_area > 0.0 {
             min_area / avg_renderable_area
         } else {
@@ -443,15 +443,15 @@ impl SpaceInsightApp {
             return false;
         }
 
-        // Jump only when in-place rendering quality is expected to be poor.
-        let too_many_hidden = hidden_ratio >= hidden_threshold && child_count >= 8;
-        let too_few_visible = renderable_count < visible_min_needed && child_count >= 8;
+        // Jump only when in-place rendering quality is expected to be very poor.
+        let too_many_hidden = hidden_ratio >= hidden_threshold && child_count >= 14;
+        let too_few_visible = renderable_count <= visible_min_needed && child_count >= 16;
         let overloaded_visible = renderable_count > AUTO_JUMP_VISIBLE_CAP
-            && hidden_ratio > hidden_threshold * 0.85
-            && child_count >= 16;
-        let pressure_too_high = area_pressure > pressure_threshold && child_count >= 12;
+            && hidden_ratio > hidden_threshold * 0.95
+            && child_count >= 24;
+        let pressure_too_high = area_pressure > pressure_threshold && child_count >= 20;
         let region_too_small_for_density =
-            content_width < 150.0 && content_height < 110.0 && child_count >= 10 && dir_children >= 3;
+            content_width < 130.0 && content_height < 95.0 && child_count >= 18 && dir_children >= 5;
 
         too_many_hidden
             || too_few_visible
@@ -540,8 +540,9 @@ impl SpaceInsightApp {
             return false;
         }
 
+        // Preserve split/expand state so stepping back keeps previous view status.
+        self.expansion_state.expand(path);
         self.view_root_path = Some(path.to_path_buf());
-        self.expansion_state.collapse_all();
         true
     }
 
@@ -653,34 +654,57 @@ impl SpaceInsightApp {
 
         let name_font = egui::FontId::proportional(name_size);
         let size_font = egui::FontId::proportional(size_size);
-        let name_galley = painter.layout_no_wrap(name_text.to_owned(), name_font.clone(), name_color);
         let size_galley = painter.layout_no_wrap(size_text.to_owned(), size_font.clone(), size_color);
 
+        if size_galley.size().x > available.width() || size_galley.size().y >= available.height() {
+            return false;
+        }
+
+        let line_probe = painter.layout_no_wrap("Ag".to_owned(), name_font.clone(), name_color);
+        let name_line_height = line_probe.size().y.max(1.0);
+        let spacing = 4.0;
+
+        let name_height_budget = available.height() - size_galley.size().y - spacing;
+        if name_height_budget < name_line_height * 0.9 {
+            return false;
+        }
+
+        let max_rows_by_height = (name_height_budget / name_line_height).floor() as usize;
+        let max_name_rows = max_rows_by_height.clamp(1, 3);
+
+        let mut name_job = egui::text::LayoutJob::default();
+        name_job.wrap.max_width = available.width();
+        name_job.wrap.max_rows = max_name_rows;
+        name_job.wrap.break_anywhere = true;
+        name_job.append(
+            name_text,
+            0.0,
+            egui::text::TextFormat::simple(name_font.clone(), name_color),
+        );
+
+        let name_galley = painter.layout_job(name_job);
+
         let max_width = name_galley.size().x.max(size_galley.size().x);
-        let total_height = name_galley.size().y + size_galley.size().y + 4.0;
+        let total_height = name_galley.size().y + size_galley.size().y + spacing;
 
         if max_width > available.width() || total_height > available.height() {
             return false;
         }
 
-        let first_center_y = available.center().y - (size_galley.size().y + 4.0) * 0.5;
-        let second_center_y = available.center().y + (name_galley.size().y + 4.0) * 0.5;
+        if name_galley.rows.is_empty() {
+            return false;
+        }
+
+        let top_y = available.center().y - total_height * 0.5;
+        let name_pos = egui::pos2(available.center().x - name_galley.size().x * 0.5, top_y);
+        let size_pos = egui::pos2(
+            available.center().x - size_galley.size().x * 0.5,
+            top_y + name_galley.size().y + spacing,
+        );
 
         let clipped = painter.with_clip_rect(rect);
-        clipped.text(
-            egui::pos2(available.center().x, first_center_y),
-            egui::Align2::CENTER_CENTER,
-            name_text,
-            name_font,
-            name_color,
-        );
-        clipped.text(
-            egui::pos2(available.center().x, second_center_y),
-            egui::Align2::CENTER_CENTER,
-            size_text,
-            size_font,
-            size_color,
-        );
+        clipped.galley(name_pos, name_galley, name_color);
+        clipped.galley(size_pos, size_galley, size_color);
 
         true
     }
