@@ -50,34 +50,6 @@ impl FileTree {
         }
     }
 
-    /// Add a node to the tree
-    pub fn add_node(&mut self, path: PathBuf, size: u64, is_dir: bool) {
-        let name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("")
-            .to_string();
-
-        let node = TreeNode {
-            path: path.clone(),
-            name,
-            size,
-            is_dir,
-            cumulative_size: size,
-        };
-
-        let node_id = self.arena.new_node(node);
-        
-        // Find parent
-        if let Some(parent_path) = path.parent() {
-            if let Some(&parent_id) = self.path_to_node.get(parent_path) {
-                parent_id.append(node_id, &mut self.arena);
-            }
-        }
-
-        self.path_to_node.insert(path, node_id);
-    }
-
     /// Calculate cumulative sizes for all directories (bottom-up)
     pub fn calculate_sizes(&mut self) {
         self.calculate_sizes_recursive(self.root);
@@ -271,9 +243,9 @@ mod tests {
     #[test]
     fn test_tree_basic() {
         let mut tree = FileTree::new("/test");
-        tree.add_node(PathBuf::from("/test/file1.txt"), 100, false);
-        tree.add_node(PathBuf::from("/test/dir1"), 0, true);
-        tree.add_node(PathBuf::from("/test/dir1/file2.txt"), 200, false);
+        tree.upsert_node(PathBuf::from("/test/file1.txt"), 100, false);
+        tree.upsert_node(PathBuf::from("/test/dir1"), 0, true);
+        tree.upsert_node(PathBuf::from("/test/dir1/file2.txt"), 200, false);
         
         tree.calculate_sizes();
         
