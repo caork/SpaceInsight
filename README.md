@@ -2,7 +2,7 @@
 
 ![SpaceInsight](img/spaceInsight.jpg)
 
-A blazingly fast, GPU-accelerated disk space analyzer built in Rust. Designed to outperform SpaceSniffer with multi-threaded scanning and real-time treemap visualization.
+A blazingly fast disk space analyzer built in Rust, with both a GPU GUI and a clickable terminal TUI. Designed to outperform SpaceSniffer with multi-threaded scanning and real-time treemap visualization.
 
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Build](https://img.shields.io/badge/build-passing-brightgreen.svg)
@@ -30,6 +30,12 @@ A blazingly fast, GPU-accelerated disk space analyzer built in Rust. Designed to
 - macOS
 - Linux
 
+⌨️ **Terminal TUI (Linux-friendly)**
+- Separate executable: `spaceinsight-tui`
+- Clickable treemap tiles in terminal (mouse support)
+- Split-pane interface with typed path input
+- Keyboard controls for zoom/expand/collapse navigation
+
 ## Quick Start
 
 ### Installation
@@ -42,20 +48,35 @@ cd SpaceInsight
 # Build the release version
 cargo build --release
 
-# Run the application
-cargo run --release
+# Run GUI (default)
+cargo run --release --bin spaceinsight
+
+# Run Terminal TUI
+cargo run --release --bin spaceinsight-tui
 ```
 
-### Usage
+### GUI Usage
 
 1. Launch SpaceInsight
 2. Enter a directory path (or leave empty to scan current directory)
 3. Click "Scan" to start the analysis
 4. Watch the treemap populate in real-time!
 
+### TUI Usage
+
+```bash
+./target/release/spaceinsight-tui
+```
+
+- Press `/` to edit path, then `Enter` to scan
+- Left click on tiles to select + expand/collapse folders
+- Right click folder tiles to zoom into them
+- Press `u` (or Backspace) to zoom out one level
+- Press `q` to quit
+
 ## Architecture
 
-SpaceInsight is built on three core components:
+SpaceInsight is built on shared core components plus two frontends:
 
 ### 1. File Crawler (`crawler.rs`)
 - Uses `jwalk` for parallel directory traversal
@@ -72,10 +93,19 @@ SpaceInsight is built on three core components:
 - Recursive partitioning for optimal visualization
 - Handles deep directory hierarchies without stack overflow
 
-### 4. GUI (`main.rs`)
+### 4. Shared Library (`lib.rs`)
+- Re-exports scanning/layout/render modules for multiple binaries
+- Keeps GUI/TUI entrypoints small and maintainable
+
+### 5. GUI (`main.rs`)
 - `egui` immediate-mode GUI
 - Background thread for non-blocking scans
 - Dynamic color scheme based on file sizes
+
+### 6. TUI (`bin/spaceinsight-tui.rs`)
+- `ratatui` + `crossterm` terminal UI
+- Clickable text-mode treemap with split panes
+- Keyboard + mouse navigation and directory drill-down
 
 ## Performance
 
@@ -117,12 +147,15 @@ the binary was built on a newer Linux distribution than your system. Build from 
 ```bash
 cargo build --release
 ./target/release/spaceinsight
+./target/release/spaceinsight-tui
 ```
 
-GitHub Actions now publishes two Linux artifacts:
+GitHub Actions now publishes Linux artifacts for both binaries:
 
-- `spaceinsight-linux` (standard Linux build on Ubuntu 22.04)
-- `spaceinsight-linux-manylinux` (compatibility build targeting `glibc 2.17`)
+- `spaceinsight-linux` (GUI, standard Linux build on Ubuntu 22.04)
+- `spaceinsight-tui-linux` (TUI, standard Linux build on Ubuntu 22.04)
+- `spaceinsight-linux-manylinux` (GUI, compatibility build targeting `glibc 2.17`)
+- `spaceinsight-tui-linux-manylinux` (TUI, compatibility build targeting `glibc 2.17`)
 
 Use `spaceinsight-linux-manylinux` if you need maximum distro compatibility.
 
@@ -133,10 +166,13 @@ Windows and macOS workflow outputs are unchanged.
 ```
 SpaceInsight/
 ├── src/
-│   ├── main.rs       # GUI application
-│   ├── crawler.rs    # File system scanner
-│   ├── tree.rs       # Hierarchical data structure
-│   └── treemap.rs    # Layout algorithm
+│   ├── lib.rs                  # Shared modules for all binaries
+│   ├── main.rs                 # GUI application (spaceinsight)
+│   ├── bin/
+│   │   └── spaceinsight-tui.rs # Terminal TUI application
+│   ├── crawler.rs              # File system scanner
+│   ├── tree.rs                 # Hierarchical data structure
+│   └── treemap.rs              # Layout algorithm
 ├── Cargo.toml        # Dependencies and build config
 └── .github/
     └── workflows/
@@ -151,6 +187,8 @@ SpaceInsight/
 - **indextree** - Arena-based tree structure
 - **dashmap** - Concurrent HashMap
 - **serde** - Serialization framework
+- **ratatui** - Terminal UI framework
+- **crossterm** - Cross-platform terminal input/output
 
 ## Roadmap
 

@@ -8,19 +8,14 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
 
-mod animation;
-mod crawler;
-mod expand_state;
-mod render_tree;
-mod tree;
-mod treemap;
-
-use animation::LayoutAnimator;
-use crawler::{FileCrawler, ScanProgress, ScanStats, ScanTopLevelPreview};
-use expand_state::ExpansionState;
-use render_tree::{build_render_tree, RenderNode, BORDER_VISUAL_WIDTH, HEADER_HEIGHT, SIDE_INSET};
-use tree::FileTree;
-use treemap::{Rect, SquarifiedTreemap, TreemapItem};
+use spaceinsight::animation::LayoutAnimator;
+use spaceinsight::crawler::{FileCrawler, ScanPhase, ScanProgress, ScanStats, ScanTopLevelPreview};
+use spaceinsight::expand_state::ExpansionState;
+use spaceinsight::render_tree::{
+    build_render_tree, RenderNode, BORDER_VISUAL_WIDTH, HEADER_HEIGHT, SIDE_INSET,
+};
+use spaceinsight::tree::FileTree;
+use spaceinsight::treemap::{Rect, SquarifiedTreemap, TreemapItem};
 
 const TILE_GUTTER: f32 = 1.0;
 const TILE_CORNER_MAX: f32 = 8.0;
@@ -189,7 +184,7 @@ impl SpaceInsightApp {
         self.is_scanning = true;
         self.scan_preview_items.clear();
         self.scan_progress = Some(ScanProgress {
-            phase: crawler::ScanPhase::Discovering,
+            phase: ScanPhase::Discovering,
             discovered_entries: 0,
             processed_entries: 0,
             total_entries: None,

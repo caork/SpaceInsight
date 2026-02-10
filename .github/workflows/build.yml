@@ -41,6 +41,13 @@ jobs:
         with:
           name: spaceinsight-linux
           path: target/release/spaceinsight
+
+      - name: Upload Artifact (Linux TUI)
+        if: matrix.os == 'ubuntu-22.04'
+        uses: actions/upload-artifact@v4
+        with:
+          name: spaceinsight-tui-linux
+          path: target/release/spaceinsight-tui
           
       - name: Upload Artifact (Windows)
         if: matrix.os == 'windows-latest'
@@ -48,6 +55,13 @@ jobs:
         with:
           name: spaceinsight-windows
           path: target/release/spaceinsight.exe
+
+      - name: Upload Artifact (Windows TUI)
+        if: matrix.os == 'windows-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: spaceinsight-tui-windows
+          path: target/release/spaceinsight-tui.exe
           
       - name: Upload Artifact (macOS)
         if: matrix.os == 'macos-latest'
@@ -55,6 +69,13 @@ jobs:
         with:
           name: spaceinsight-macos
           path: target/release/spaceinsight
+
+      - name: Upload Artifact (macOS TUI)
+        if: matrix.os == 'macos-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: spaceinsight-tui-macos
+          path: target/release/spaceinsight-tui
 
   build-linux-compatible:
     name: Build Linux Compatible (glibc 2.17)
@@ -87,9 +108,16 @@ jobs:
       - name: Verify glibc compatibility
         run: |
           objdump -T target/x86_64-unknown-linux-gnu.2.17/release/spaceinsight | grep GLIBC_ | sort -Vu | tail
+          objdump -T target/x86_64-unknown-linux-gnu.2.17/release/spaceinsight-tui | grep GLIBC_ | sort -Vu | tail
 
       - name: Upload Artifact (Linux manylinux-compatible)
         uses: actions/upload-artifact@v4
         with:
           name: spaceinsight-linux-manylinux
           path: target/x86_64-unknown-linux-gnu.2.17/release/spaceinsight
+
+      - name: Upload Artifact (Linux TUI manylinux-compatible)
+        uses: actions/upload-artifact@v4
+        with:
+          name: spaceinsight-tui-linux-manylinux
+          path: target/x86_64-unknown-linux-gnu.2.17/release/spaceinsight-tui
