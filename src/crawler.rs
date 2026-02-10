@@ -324,11 +324,6 @@ impl FileCrawler {
         (nodes, stats)
     }
 
-    /// Scan a directory without progress callbacks.
-    pub fn scan<P: AsRef<Path>>(&mut self, root: P) -> (Arc<DashMap<PathBuf, FileNode>>, ScanStats) {
-        self.scan_with_progress(root, None)
-    }
-
     fn should_skip_path(path: &Path) -> bool {
         let normalized = path.to_string_lossy().replace('\\', "/");
         ABNORMAL_PATH_MARKERS
@@ -350,7 +345,7 @@ mod tests {
     #[test]
     fn test_crawler_basic() {
         let mut crawler = FileCrawler::new();
-        let (nodes, stats) = crawler.scan(".");
+        let (nodes, stats) = crawler.scan_with_progress(".", None);
         
         assert!(stats.total_files > 0 || stats.total_dirs > 0);
         assert!(!nodes.is_empty());
