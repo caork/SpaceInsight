@@ -1,4 +1,4 @@
-use std::collections::hash_map::DefaultHasher;
+use std::collections::{hash_map::DefaultHasher, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 
@@ -17,18 +17,46 @@ pub const SIDE_INSET: f32 = 1.0;
 
 // --- Aggregation parameters ---
 
-/// Absolute minimum area (px²) for an item to render individually (~20x20).
-const MIN_USEFUL_AREA: f32 = 400.0;
+/// Absolute minimum area (px²) for an item to render individually.
+const MIN_USEFUL_AREA: f32 = 520.0;
 
 /// Minimum fraction of container area. Items below this are too small to see.
-const MIN_AREA_PCT: f32 = 0.005; // 0.5% of container
+const MIN_AREA_PCT: f32 = 0.0065;
 
 /// Soft cap on individual items per level before aggregation kicks in.
-const PREFERRED_MAX_ITEMS: usize = 12;
+const PREFERRED_MAX_ITEMS: usize = 10;
 
 /// Maximum fraction of total size the grey block may consume.
 /// If the aggregate would exceed this, items are rescued back out.
 const MAX_AGGREGATE_FRACTION: f32 = 0.08; // 8%
+
+/// Relaxed parameters when user clicks the aggregate block to split small items.
+const SPLIT_MIN_USEFUL_AREA: f32 = 0.0;
+const SPLIT_MIN_AREA_PCT: f32 = 0.0;
+const SPLIT_PREFERRED_MAX_ITEMS: usize = usize::MAX;
+const SPLIT_MAX_AGGREGATE_FRACTION: f32 = 1.0;
+
+#[derive(Clone, Copy)]
+struct AggregatePolicy {
+    min_useful_area: f32,
+    min_area_pct: f32,
+    preferred_max_items: usize,
+    max_aggregate_fraction: f32,
+}
+
+const DEFAULT_AGGREGATION_POLICY: AggregatePolicy = AggregatePolicy {
+    min_useful_area: MIN_USEFUL_AREA,
+    min_area_pct: MIN_AREA_PCT,
+    preferred_max_items: PREFERRED_MAX_ITEMS,
+    max_aggregate_fraction: MAX_AGGREGATE_FRACTION,
+};
+
+const SPLIT_AGGREGATION_POLICY: AggregatePolicy = AggregatePolicy {
+    min_useful_area: SPLIT_MIN_USEFUL_AREA,
+    min_area_pct: SPLIT_MIN_AREA_PCT,
+    preferred_max_items: SPLIT_PREFERRED_MAX_ITEMS,
+    max_aggregate_fraction: SPLIT_MAX_AGGREGATE_FRACTION,
+};
 
 /// A node in the render tree, produced by build_render_tree.
 #[derive(Clone)]
@@ -75,14 +103,19 @@ struct ChildInfo {
 ///
 /// This ensures: small noise is swept up, the grey block never dominates,
 /// and the visible layout has a manageable number of well-sized items.
-fn partition_children(children: &[ChildInfo], total_size: u64, container_area: f32) -> (Vec<usize>, Vec<usize>) {
+fn partition_children(
+    children: &[ChildInfo],
+    total_size: u64,
+    container_area: f32,
+    policy: AggregatePolicy,
+) -> (Vec<usize>, Vec<usize>) {
     let n = children.len();
     if n == 0 {
         return (vec![], vec![]);
     }
     // children are already sorted by size descending
 
-    let min_area = MIN_USEFUL_AREA.max(container_area * MIN_AREA_PCT);
+    let min_area = policy.min_useful_area.max(container_area * policy.min_area_pct);
 
     // Phase 1: area filter
     let mut kept: Vec<usize> = Vec::new();
@@ -102,13 +135,13 @@ fn partition_children(children: &[ChildInfo], total_size: u64, container_area: f
     }
 
     // Phase 2: count cap — if too many kept, move smallest to aggregate
-    while kept.len() > PREFERRED_MAX_ITEMS {
+    while kept.len() > policy.preferred_max_items {
         let removed = kept.pop().unwrap(); // smallest of kept (sorted desc)
         aggregated.insert(0, removed); // insert at front (it's the largest of aggregated)
     }
 
     // Phase 3: budget rescue — if aggregate too large, pull items back
-    let budget = total_size as f64 * MAX_AGGREGATE_FRACTION as f64;
+    let budget = total_size as f64 * policy.max_aggregate_fraction as f64;
     let mut agg_total: u64 = aggregated.iter().map(|&i| children[i].size).sum();
 
     while agg_total as f64 > budget && !aggregated.is_empty() {
@@ -138,8 +171,19 @@ pub fn build_render_tree(
     container: Rect,
     expansion: &ExpansionState,
     max_depth: usize,
+    split_small_items_roots: &HashSet<PathBuf>,
 ) -> Vec<RenderNode> {
     let arena = tree.get_arena();
+
+    let Some(root_path) = arena.get(root_id).map(|n| n.get().path.clone()) else {
+        return Vec::new();
+    };
+
+    let aggregation_policy = if split_small_items_roots.contains(&root_path) {
+        SPLIT_AGGREGATION_POLICY
+    } else {
+        DEFAULT_AGGREGATION_POLICY
+    };
 
     let mut children: Vec<ChildInfo> = root_id
         .children(arena)
@@ -167,7 +211,8 @@ pub fn build_render_tree(
     let total_size: u64 = children.iter().map(|c| c.size).sum();
     let container_area = container.area();
 
-    let (kept_indices, agg_indices) = partition_children(&children, total_size, container_area);
+    let (kept_indices, agg_indices) =
+        partition_children(&children, total_size, container_area, aggregation_policy);
 
     let aggregate_size: u64 = agg_indices.iter().map(|&i| children[i].size).sum();
     let aggregate_count = agg_indices.len();
@@ -242,7 +287,14 @@ pub fn build_render_tree(
             );
 
             let sub = if cr.width > 4.0 && cr.height > 4.0 {
-                build_render_tree(tree, child.node_id, cr, expansion, max_depth - 1)
+                build_render_tree(
+                    tree,
+                    child.node_id,
+                    cr,
+                    expansion,
+                    max_depth - 1,
+                    split_small_items_roots,
+                )
             } else {
                 Vec::new()
             };
@@ -327,7 +379,8 @@ mod tests {
         let total: u64 = children.iter().map(|c| c.size).sum();
         let container_area = 936_000.0;
 
-        let (kept, agg) = partition_children(&children, total, container_area);
+        let (kept, agg) =
+            partition_children(&children, total, container_area, DEFAULT_AGGREGATION_POLICY);
         let agg_size: u64 = agg.iter().map(|&i| children[i].size).sum();
         let agg_frac = agg_size as f32 / total as f32;
 
@@ -346,7 +399,8 @@ mod tests {
         let total: u64 = children.iter().map(|c| c.size).sum();
         let container_area = 936_000.0;
 
-        let (kept, agg) = partition_children(&children, total, container_area);
+        let (kept, agg) =
+            partition_children(&children, total, container_area, DEFAULT_AGGREGATION_POLICY);
         let agg_size: u64 = agg.iter().map(|&i| children[i].size).sum();
         let agg_frac = agg_size as f32 / total as f32;
 
@@ -364,9 +418,28 @@ mod tests {
         let total: u64 = children.iter().map(|c| c.size).sum();
         let container_area = 936_000.0;
 
-        let (kept, agg) = partition_children(&children, total, container_area);
+        let (kept, agg) =
+            partition_children(&children, total, container_area, DEFAULT_AGGREGATION_POLICY);
 
         assert_eq!(kept.len(), 3);
         assert_eq!(agg.len(), 0);
+    }
+
+    #[test]
+    fn test_split_policy_keeps_more_items() {
+        let sizes: Vec<u64> = vec![100; 50];
+        let (_arena, children) = make_children(&sizes);
+        let total: u64 = children.iter().map(|c| c.size).sum();
+        let container_area = 936_000.0;
+
+        let (default_kept, _default_agg) =
+            partition_children(&children, total, container_area, DEFAULT_AGGREGATION_POLICY);
+        let (split_kept, _split_agg) =
+            partition_children(&children, total, container_area, SPLIT_AGGREGATION_POLICY);
+
+        assert!(
+            split_kept.len() > default_kept.len(),
+            "Split mode should keep more individual items"
+        );
     }
 }

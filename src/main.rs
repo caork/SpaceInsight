@@ -1,6 +1,6 @@
 use eframe::egui;
 use notify::{event::ModifyKind, Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -23,10 +23,12 @@ const TILE_BORDER_WIDTH_DIR: f32 = 0.85;
 const TILE_BORDER_WIDTH_FILE: f32 = 0.75;
 const TILE_BORDER_WIDTH_AGG: f32 = 0.7;
 const AUTO_JUMP_SENSITIVITY: f32 = 0.0;
-const AUTO_JUMP_MIN_USEFUL_AREA: f32 = 400.0;
-const AUTO_JUMP_MIN_AREA_PCT: f32 = 0.005;
-const AUTO_JUMP_VISIBLE_CAP: usize = 12;
+const AUTO_JUMP_MIN_USEFUL_AREA: f32 = 280.0;
+const AUTO_JUMP_MIN_AREA_PCT: f32 = 0.003;
+const AUTO_JUMP_VISIBLE_CAP: usize = 16;
 const LAYOUT_TRANSITION_DURATION: f32 = 0.22;
+const AGGREGATE_NODE_MARKER: &str = "__aggregate__";
+const SMALL_BOX_SPLIT_TRIGGER_AREA: f32 = 520.0;
 
 fn main() -> Result<(), eframe::Error> {
     let options = eframe::NativeOptions {
@@ -80,6 +82,7 @@ fn configure_custom_style(ctx: &egui::Context) {
 enum ClickAction {
     Expand(PathBuf),
     Deepen(PathBuf),
+    SplitSmallItems(PathBuf),
     Collapse(PathBuf),
     SelectFile(PathBuf),
     OpenPath(PathBuf),
@@ -111,6 +114,7 @@ struct SpaceInsightApp {
     root_node_id: Option<indextree::NodeId>,
     view_root_path: Option<PathBuf>,
     expansion_state: ExpansionState,
+    split_small_items_roots: HashSet<PathBuf>,
     render_nodes: Vec<RenderNode>,
     layout_transition: Option<LayoutTransition>,
     hovered_path: Option<PathBuf>,
@@ -146,6 +150,7 @@ impl Default for SpaceInsightApp {
             root_node_id: None,
             view_root_path: None,
             expansion_state: ExpansionState::default(),
+            split_small_items_roots: HashSet::new(),
             render_nodes: Vec::new(),
             layout_transition: None,
             hovered_path: None,
@@ -282,6 +287,7 @@ impl SpaceInsightApp {
 
         self.view_root_path = None;
         self.expansion_state = ExpansionState::default();
+        self.split_small_items_roots.clear();
         self.selected_path = None;
         self.hovered_path = None;
         self.render_nodes.clear();
@@ -483,6 +489,9 @@ impl SpaceInsightApp {
                 self.view_root_path = None;
             }
         }
+
+        self.split_small_items_roots
+            .retain(|path| tree.get_node(path).is_some());
     }
 
     fn preview_to_top_level_items(preview: &[ScanTopLevelPreview]) -> Vec<TopLevelItem> {
@@ -654,6 +663,7 @@ impl SpaceInsightApp {
                 container,
                 &self.expansion_state,
                 usize::MAX,
+                &self.split_small_items_roots,
             );
 
             if self.render_nodes.is_empty() || next_nodes.is_empty() {
@@ -817,6 +827,33 @@ impl SpaceInsightApp {
         None
     }
 
+    fn aggregate_container_path(path: &Path) -> Option<PathBuf> {
+        let marker_ok = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| name == AGGREGATE_NODE_MARKER)
+            .unwrap_or(false);
+
+        if !marker_ok {
+            return None;
+        }
+
+        path.parent().map(|parent| parent.to_path_buf())
+    }
+
+    fn enable_split_small_items_for_path(&mut self, path: &Path) -> bool {
+        let Some(tree) = self.file_tree.as_ref() else {
+            return false;
+        };
+
+        if tree.get_node(path).is_none() {
+            return false;
+        }
+
+        self.split_small_items_roots.insert(path.to_path_buf());
+        true
+    }
+
     fn should_zoom_into_folder(&self, path: &Path, viewport_rect: egui::Rect) -> bool {
         let Some(node) = Self::find_render_node_by_path(&self.render_nodes, path) else {
             return false;
@@ -908,20 +945,56 @@ impl SpaceInsightApp {
         }
 
         // Jump only when in-place rendering quality is expected to be very poor.
-        let too_many_hidden = hidden_ratio >= hidden_threshold && child_count >= 14;
-        let too_few_visible = renderable_count <= visible_min_needed && child_count >= 16;
+        let too_many_hidden = hidden_ratio >= hidden_threshold && child_count >= 18;
+        let too_few_visible = renderable_count <= visible_min_needed && child_count >= 20;
         let overloaded_visible = renderable_count > AUTO_JUMP_VISIBLE_CAP
             && hidden_ratio > hidden_threshold * 0.95
-            && child_count >= 24;
-        let pressure_too_high = area_pressure > pressure_threshold && child_count >= 20;
+            && child_count >= 28;
+        let pressure_too_high = area_pressure > pressure_threshold && child_count >= 24;
         let region_too_small_for_density =
-            content_width < 130.0 && content_height < 95.0 && child_count >= 18 && dir_children >= 5;
+            content_width < 130.0 && content_height < 95.0 && child_count >= 22 && dir_children >= 5;
 
-        too_many_hidden
-            || too_few_visible
-            || overloaded_visible
-            || pressure_too_high
-            || region_too_small_for_density
+        // Auto-jump only for severe readability failure; otherwise keep user in-place.
+        let severe_quality_loss = too_many_hidden && (too_few_visible || pressure_too_high);
+        let crowded_and_hidden = overloaded_visible && too_many_hidden;
+        let tiny_region_overload = region_too_small_for_density && too_few_visible;
+
+        severe_quality_loss || crowded_and_hidden || tiny_region_overload
+    }
+
+    fn auto_zoom_target_path(&self, path: &Path) -> Option<PathBuf> {
+        let (Some(tree), Some(global_root_id)) = (&self.file_tree, self.root_node_id) else {
+            return None;
+        };
+
+        let arena = tree.get_arena();
+        let global_root_path = arena.get(global_root_id).map(|n| n.get().path.clone())?;
+
+        let current_root = self
+            .view_root_path
+            .as_ref()
+            .filter(|candidate| tree.get_node(candidate).is_some())
+            .cloned()
+            .unwrap_or_else(|| global_root_path.clone());
+
+        if path == current_root || !path.starts_with(&current_root) {
+            return None;
+        }
+
+        // Auto-jump goes only one level deeper at a time.
+        let relative = path.strip_prefix(&current_root).ok()?;
+        let first_component = relative.components().next()?;
+        let target = current_root.join(first_component.as_os_str());
+
+        if tree.get_node(&target).is_none() {
+            return None;
+        }
+
+        if self.view_root_path.as_deref() == Some(target.as_path()) {
+            return None;
+        }
+
+        Some(target)
     }
 
     fn pick_folder_path() -> Option<PathBuf> {
@@ -1004,9 +1077,14 @@ impl SpaceInsightApp {
             return false;
         }
 
+        let Some(zoom_target) = self.auto_zoom_target_path(path) else {
+            return false;
+        };
+
         // Preserve split/expand state so stepping back keeps previous view status.
         self.expansion_state.expand(path);
-        self.view_root_path = Some(path.to_path_buf());
+        self.expansion_state.expand(&zoom_target);
+        self.view_root_path = Some(zoom_target);
         true
     }
 
@@ -1455,19 +1533,40 @@ impl SpaceInsightApp {
                 let is_hovered = response.hovered();
 
                 if is_hovered {
-                    *hovered_path = Some(node.path.clone());
-                    if node.is_dir {
+                    *hovered_path = if node.is_aggregate {
+                        Self::aggregate_container_path(&node.path)
+                    } else {
+                        Some(node.path.clone())
+                    };
+                    if node.is_dir || node.is_aggregate {
                         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                     }
                 }
 
-                // Click handling (no click action for aggregate blocks)
-                if action.is_none() && !node.is_aggregate {
-                    if response.double_clicked() && node.is_dir {
+                // Click handling
+                if action.is_none() {
+                    if node.is_aggregate {
+                        if response.double_clicked() || response.clicked() {
+                            if let Some(container_path) = Self::aggregate_container_path(&node.path) {
+                                action = Some(ClickAction::SplitSmallItems(container_path));
+                            }
+                        }
+                    } else if response.double_clicked() && node.is_dir {
                         action = Some(ClickAction::Deepen(node.path.clone()));
                     } else if response.clicked() {
                         if node.is_dir {
-                            action = Some(ClickAction::Expand(node.path.clone()));
+                            let content_width = (node.outer_rect.width - 2.0 * SIDE_INSET).max(1.0);
+                            let content_height =
+                                (node.outer_rect.height - HEADER_HEIGHT - SIDE_INSET).max(1.0);
+                            let content_area = (content_width * content_height).max(1.0);
+                            let too_small_to_split_in_place =
+                                content_width <= 4.0 || content_height <= 4.0;
+
+                            if too_small_to_split_in_place || content_area < SMALL_BOX_SPLIT_TRIGGER_AREA {
+                                action = Some(ClickAction::SplitSmallItems(node.path.clone()));
+                            } else {
+                                action = Some(ClickAction::Expand(node.path.clone()));
+                            }
                         } else {
                             action = Some(ClickAction::SelectFile(node.path.clone()));
                         }
@@ -1509,7 +1608,7 @@ impl SpaceInsightApp {
                     }
                     if is_hovered {
                         response.on_hover_text(format!(
-                            "{} ({}, {} items)",
+                            "{} ({}, {} items)\nClick to split",
                             node.name,
                             size_text,
                             node.aggregate_count
@@ -1787,6 +1886,7 @@ impl eframe::App for SpaceInsightApp {
                 if self.has_data {
                     if ui.button("Collapse All").clicked() {
                         self.expansion_state.collapse_all();
+                        self.split_small_items_roots.clear();
                         if let Some(rect) = self.last_container_rect {
                             self.rebuild_render_tree(rect);
                         }
@@ -1896,6 +1996,28 @@ impl eframe::App for SpaceInsightApp {
                                     }
                                 }
                                 self.rebuild_render_tree(available_rect);
+                            }
+                            ClickAction::SplitSmallItems(path) => {
+                                if self.enable_split_small_items_for_path(&path) {
+                                    let mut did_zoom = self.maybe_zoom_into_folder(&path, available_rect);
+                                    if !did_zoom {
+                                        if let Some(zoom_target) = self.auto_zoom_target_path(&path) {
+                                            self.expansion_state.expand(&path);
+                                            self.expansion_state.expand(&zoom_target);
+                                            self.view_root_path = Some(zoom_target);
+                                            did_zoom = true;
+                                        }
+                                    }
+
+                                    if !did_zoom && !self.expansion_state.is_expanded(&path) {
+                                        self.expansion_state.expand(&path);
+                                    }
+
+                                    if did_zoom {
+                                        self.selected_path = None;
+                                    }
+                                    self.rebuild_render_tree(available_rect);
+                                }
                             }
                             ClickAction::Collapse(path) => {
                                 self.expansion_state.collapse_recursive(&path);

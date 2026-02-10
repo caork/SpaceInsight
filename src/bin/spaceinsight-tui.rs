@@ -16,6 +16,7 @@ use spaceinsight::render_tree::{build_render_tree, RenderNode};
 use spaceinsight::tree::FileTree;
 use spaceinsight::treemap::Rect;
 use std::cmp::Ordering;
+use std::collections::HashSet;
 use std::io::{self, stdout};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -428,12 +429,14 @@ impl App {
         }
 
         let layout_container = Rect::new(0.0, 0.0, area.width as f32, area.height as f32);
+        let split_small_items_roots = HashSet::new();
         let render_nodes = build_render_tree(
             tree,
             view_root_id,
             layout_container,
             &self.expansion_state,
             MAX_RENDER_DEPTH,
+            &split_small_items_roots,
         );
 
         let mut tiles = Vec::new();
