@@ -152,10 +152,10 @@ cargo build --release
 
 GitHub Actions now publishes architecture-specific artifacts:
 
-- `spaceinsight-linux-<x86_64|arm64>` (GUI, standard Linux build on Ubuntu 22.04)
-- `spaceinsight-windows-<x86_64|arm64>` (GUI, standard Windows build)
-- `spaceinsight-macos-<x86_64|arm64>` (GUI, standard macOS build)
-- `spaceinsight-tui-linux-<x86_64|arm64>` (TUI, Linux only)
+- `spaceinsight-linux-<x86_64|aarch64>` (GUI, standard Linux build)
+- `spaceinsight-windows-<x86_64|aarch64>` (GUI, standard Windows build)
+- `spaceinsight-macos-<x86_64|aarch64>` (GUI, standard macOS build)
+- `spaceinsight-tui-linux-<x86_64|aarch64>` (TUI, Linux only)
 - `spaceinsight-linux-x86_64-manylinux` (GUI, compatibility build targeting `glibc 2.17`)
 - `spaceinsight-tui-linux-x86_64-manylinux` (TUI, compatibility build targeting `glibc 2.17`, Linux only)
 

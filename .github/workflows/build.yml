@@ -8,14 +8,36 @@ on:
 
 jobs:
   build:
-    name: Build on ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
-    env:
-      ARCH_LABEL: ${{ runner.arch == 'X64' && 'x86_64' || 'arm64' }}
+    name: Build on ${{ matrix.os_name }} (${{ matrix.arch_label }})
+    runs-on: ${{ matrix.runs_on }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, windows-latest, macos-latest]
+        include:
+          - os_name: linux
+            runs_on: ubuntu-22.04
+            arch_label: x86_64
+            exe_suffix: ""
+          - os_name: linux
+            runs_on: ubuntu-22.04-arm
+            arch_label: aarch64
+            exe_suffix: ""
+          - os_name: windows
+            runs_on: windows-latest
+            arch_label: x86_64
+            exe_suffix: .exe
+          - os_name: windows
+            runs_on: windows-11-arm
+            arch_label: aarch64
+            exe_suffix: .exe
+          - os_name: macos
+            runs_on: macos-13
+            arch_label: x86_64
+            exe_suffix: ""
+          - os_name: macos
+            runs_on: macos-14
+            arch_label: aarch64
+            exe_suffix: ""
         
     steps:
       - uses: actions/checkout@v4
@@ -26,49 +48,49 @@ jobs:
           toolchain: stable
           
       - name: Install Linux dependencies
-        if: matrix.os == 'ubuntu-22.04'
+        if: matrix.os_name == 'linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev libgtk-3-dev
           
       - name: Build Release (Linux GUI + TUI)
-        if: matrix.os == 'ubuntu-22.04'
+        if: matrix.os_name == 'linux'
         run: cargo build --release
 
       - name: Build Release (Windows/macOS GUI)
-        if: matrix.os != 'ubuntu-22.04'
+        if: matrix.os_name != 'linux'
         run: cargo build --release --bin spaceinsight
         
       - name: Run Tests
         run: cargo test --release
         
       - name: Upload Artifact (Linux)
-        if: matrix.os == 'ubuntu-22.04'
+        if: matrix.os_name == 'linux'
         uses: actions/upload-artifact@v4
         with:
-          name: spaceinsight-linux-${{ env.ARCH_LABEL }}
-          path: target/release/spaceinsight
+          name: spaceinsight-linux-${{ matrix.arch_label }}
+          path: target/release/spaceinsight${{ matrix.exe_suffix }}
 
       - name: Upload Artifact (Linux TUI)
-        if: matrix.os == 'ubuntu-22.04'
+        if: matrix.os_name == 'linux'
         uses: actions/upload-artifact@v4
         with:
-          name: spaceinsight-tui-linux-${{ env.ARCH_LABEL }}
-          path: target/release/spaceinsight-tui
+          name: spaceinsight-tui-linux-${{ matrix.arch_label }}
+          path: target/release/spaceinsight-tui${{ matrix.exe_suffix }}
           
       - name: Upload Artifact (Windows)
-        if: matrix.os == 'windows-latest'
+        if: matrix.os_name == 'windows'
         uses: actions/upload-artifact@v4
         with:
-          name: spaceinsight-windows-${{ env.ARCH_LABEL }}
-          path: target/release/spaceinsight.exe
+          name: spaceinsight-windows-${{ matrix.arch_label }}
+          path: target/release/spaceinsight${{ matrix.exe_suffix }}
           
       - name: Upload Artifact (macOS)
-        if: matrix.os == 'macos-latest'
+        if: matrix.os_name == 'macos'
         uses: actions/upload-artifact@v4
         with:
-          name: spaceinsight-macos-${{ env.ARCH_LABEL }}
-          path: target/release/spaceinsight
+          name: spaceinsight-macos-${{ matrix.arch_label }}
+          path: target/release/spaceinsight${{ matrix.exe_suffix }}
 
   build-linux-compatible:
     name: Build Linux Compatible (glibc 2.17)
