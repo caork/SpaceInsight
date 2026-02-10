@@ -213,15 +213,8 @@ impl SpaceInsightApp {
 
             let mut tree = FileTree::new(&path);
 
-            let mut paths: Vec<_> = nodes.iter().map(|entry| entry.key().clone()).collect();
-            paths.sort();
-
-            for path_entry in paths {
-                if let Some(node) = nodes.get(&path_entry) {
-                    if tree.get_node(&node.path).is_none() {
-                        tree.add_node(node.path.clone(), node.size, node.is_dir);
-                    }
-                }
+            for node in nodes {
+                tree.upsert_node(node.path, node.size, node.is_dir);
             }
 
             tree.calculate_sizes();

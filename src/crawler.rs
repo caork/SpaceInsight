@@ -1,14 +1,14 @@
 use dashmap::DashMap;
 use jwalk::WalkDir;
 use rayon::prelude::*;
+use rayon::ThreadPoolBuilder;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-const ABNORMAL_PATH_MARKERS: [&str; 1] = [
-    "/Library/Containers/com.docker.docker/Data/vms",
-];
+const PREVIEW_TOP_LIMIT: usize = 40;
+const PROGRESS_EMIT_INTERVAL_MS: u64 = 100;
 
 #[derive(Debug, Clone)]
 pub struct FileNode {
@@ -95,7 +95,28 @@ impl FileCrawler {
     fn preview_snapshot(preview_map: &DashMap<String, ScanTopLevelPreview>) -> Vec<ScanTopLevelPreview> {
         let mut preview_items: Vec<_> = preview_map.iter().map(|entry| entry.value().clone()).collect();
         preview_items.sort_by(|a, b| b.size.cmp(&a.size));
+        if preview_items.len() > PREVIEW_TOP_LIMIT {
+            preview_items.truncate(PREVIEW_TOP_LIMIT);
+        }
         preview_items
+    }
+
+    fn should_emit_progress(last_emit_ms: &AtomicU64, elapsed_ms: u64) -> bool {
+        let previous = last_emit_ms.load(Ordering::Relaxed);
+        if elapsed_ms.saturating_sub(previous) < PROGRESS_EMIT_INTERVAL_MS {
+            return false;
+        }
+
+        last_emit_ms
+            .compare_exchange(previous, elapsed_ms, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    }
+
+    fn processing_parallelism() -> usize {
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+        (cores * 2).clamp(4, 64)
     }
 
     fn top_level_name(root_path: &Path, path: &Path) -> Option<(String, bool)> {
@@ -106,16 +127,15 @@ impl FileCrawler {
         Some((first.as_os_str().to_string_lossy().to_string(), has_more))
     }
 
-    /// Scan a directory and build a flat map of all files/directories.
-    /// Returns a thread-safe map of path -> FileNode.
+    /// Scan a directory and build a flat list of all files/directories.
     pub fn scan_with_progress<P: AsRef<Path>>(
         &mut self,
         root: P,
         reporter: Option<Arc<dyn Fn(ScanProgress) + Send + Sync>>,
-    ) -> (Arc<DashMap<PathBuf, FileNode>>, ScanStats) {
+    ) -> (Vec<FileNode>, ScanStats) {
         let root_path = root.as_ref().to_path_buf();
+        let reporting_enabled = reporter.is_some();
         let start = Instant::now();
-        let nodes = Arc::new(DashMap::new());
         let top_level_preview = Arc::new(DashMap::new());
 
         // Reset counters
@@ -127,11 +147,11 @@ impl FileCrawler {
         let mut entries = Vec::new();
         let mut discovered_entries = 0u64;
 
+        let scan_threads = Self::processing_parallelism();
+
         let walker = WalkDir::new(root.as_ref())
             .skip_hidden(false)
-            .parallelism(jwalk::Parallelism::RayonDefaultPool {
-                busy_timeout: std::time::Duration::from_secs(1),
-            })
+            .parallelism(jwalk::Parallelism::RayonNewPool(scan_threads))
             .process_read_dir(|_, _, _, children| {
                 children.retain(|entry| {
                     entry
@@ -143,25 +163,30 @@ impl FileCrawler {
 
             .into_iter();
 
+        let mut discovery_last_emit = Instant::now();
+
         for entry in walker {
             if let Ok(entry) = entry {
                 discovered_entries = discovered_entries.saturating_add(1);
-                let discovered_path = entry.path();
-                if let Some((name, nested)) = Self::top_level_name(&root_path, &discovered_path) {
-                    let mut preview = top_level_preview
-                        .entry(name.clone())
-                        .or_insert_with(|| ScanTopLevelPreview {
-                            name,
-                            size: 0,
-                            is_dir: nested,
-                        });
-                    if nested {
-                        preview.is_dir = true;
+                if reporting_enabled {
+                    let discovered_path = entry.path();
+                    if let Some((name, nested)) = Self::top_level_name(&root_path, &discovered_path) {
+                        let mut preview = top_level_preview
+                            .entry(name.clone())
+                            .or_insert_with(|| ScanTopLevelPreview {
+                                name,
+                                size: 0,
+                                is_dir: nested,
+                            });
+                        if nested {
+                            preview.is_dir = true;
+                        }
+                        preview.size = preview.size.saturating_add(1);
                     }
-                    preview.size = preview.size.saturating_add(1);
                 }
 
-                if discovered_entries % 128 == 0 {
+                if reporting_enabled && discovery_last_emit.elapsed().as_millis() as u64 >= PROGRESS_EMIT_INTERVAL_MS {
+                    discovery_last_emit = Instant::now();
                     Self::emit_progress(
                         &reporter,
                         ScanProgress {
@@ -210,6 +235,8 @@ impl FileCrawler {
         );
 
         let processed_entries = Arc::new(AtomicU64::new(0));
+        let processing_last_emit_ms = Arc::new(AtomicU64::new(0));
+        let processing_started = Instant::now();
         let reporter_parallel = reporter.clone();
         let processed_parallel = processed_entries.clone();
         let file_count = self.file_count.clone();
@@ -218,85 +245,78 @@ impl FileCrawler {
         let preview_map = top_level_preview.clone();
         let root_for_workers = root_path.clone();
 
-        // Process entries in parallel using rayon
-        entries.par_iter().for_each(|entry| {
-            let processed_now = processed_parallel.fetch_add(1, Ordering::Relaxed) + 1;
+        let process_entries = || {
+            entries
+                .par_iter()
+                .filter_map(|entry| {
+                    let processed_now = processed_parallel.fetch_add(1, Ordering::Relaxed) + 1;
 
-            let path = entry.path();
-            if Self::should_skip_path(&path) {
-                if let Some(cb) = reporter_parallel.as_ref() {
-                    if processed_now % 256 == 0 || processed_now == total_entries {
-                        cb(ScanProgress {
-                            phase: ScanPhase::Processing,
-                            discovered_entries,
-                            processed_entries: processed_now,
-                            total_entries: Some(total_entries),
-                            total_files: file_count.load(Ordering::Relaxed),
-                            total_dirs: dir_count.load(Ordering::Relaxed),
-                            total_size: total_size.load(Ordering::Relaxed),
-                            top_level_preview: Self::preview_snapshot(&preview_map),
-                        });
-                    }
-                }
-                return;
-            }
+                    let path = entry.path();
+                    let metadata = entry.metadata().ok()?;
 
-            let metadata = entry.metadata().ok();
+                    let size = metadata.len();
+                    let is_dir = metadata.is_dir();
 
-            if let Some(meta) = metadata {
-                let size = meta.len();
-                let is_dir = meta.is_dir();
-
-                if is_dir {
-                    self.dir_count.fetch_add(1, Ordering::Relaxed);
-                } else {
-                    self.file_count.fetch_add(1, Ordering::Relaxed);
-                    self.total_size.fetch_add(size, Ordering::Relaxed);
-                }
-
-                if let Some((name, nested)) = Self::top_level_name(&root_for_workers, &path) {
-                    let bucket_is_dir = nested || is_dir;
-                    let mut entry = preview_map
-                        .entry(name.clone())
-                        .or_insert_with(|| ScanTopLevelPreview {
-                            name,
-                            size: 0,
-                            is_dir: bucket_is_dir,
-                        });
-
-                    if bucket_is_dir {
-                        entry.is_dir = true;
+                    if is_dir {
+                        self.dir_count.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        self.file_count.fetch_add(1, Ordering::Relaxed);
+                        self.total_size.fetch_add(size, Ordering::Relaxed);
                     }
 
-                    if !is_dir {
-                        entry.size = entry.size.saturating_add(size.max(1));
+                    if reporting_enabled {
+                        if let Some((name, nested)) = Self::top_level_name(&root_for_workers, &path) {
+                            let bucket_is_dir = nested || is_dir;
+                            let mut preview = preview_map
+                                .entry(name.clone())
+                                .or_insert_with(|| ScanTopLevelPreview {
+                                    name,
+                                    size: 0,
+                                    is_dir: bucket_is_dir,
+                                });
+
+                            if bucket_is_dir {
+                                preview.is_dir = true;
+                            }
+
+                            if !is_dir {
+                                preview.size = preview.size.saturating_add(size.max(1));
+                            }
+                        }
+
+                        if let Some(cb) = reporter_parallel.as_ref() {
+                            let elapsed_ms = processing_started.elapsed().as_millis() as u64;
+                            if processed_now == total_entries
+                                || Self::should_emit_progress(&processing_last_emit_ms, elapsed_ms)
+                            {
+                                cb(ScanProgress {
+                                    phase: ScanPhase::Processing,
+                                    discovered_entries,
+                                    processed_entries: processed_now,
+                                    total_entries: Some(total_entries),
+                                    total_files: file_count.load(Ordering::Relaxed),
+                                    total_dirs: dir_count.load(Ordering::Relaxed),
+                                    total_size: total_size.load(Ordering::Relaxed),
+                                    top_level_preview: Self::preview_snapshot(&preview_map),
+                                });
+                            }
+                        }
                     }
-                }
 
-                let node = FileNode {
-                    path: path.to_path_buf(),
-                    size,
-                    is_dir,
-                };
+                    Some(FileNode {
+                        path: path.to_path_buf(),
+                        size,
+                        is_dir,
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
 
-                nodes.insert(path.to_path_buf(), node);
-            }
-
-            if let Some(cb) = reporter_parallel.as_ref() {
-                if processed_now % 256 == 0 || processed_now == total_entries {
-                    cb(ScanProgress {
-                        phase: ScanPhase::Processing,
-                        discovered_entries,
-                        processed_entries: processed_now,
-                        total_entries: Some(total_entries),
-                        total_files: file_count.load(Ordering::Relaxed),
-                        total_dirs: dir_count.load(Ordering::Relaxed),
-                        total_size: total_size.load(Ordering::Relaxed),
-                        top_level_preview: Self::preview_snapshot(&preview_map),
-                    });
-                }
-            }
-        });
+        let nodes = ThreadPoolBuilder::new()
+            .num_threads(scan_threads)
+            .build()
+            .map(|pool| pool.install(process_entries))
+            .unwrap_or_else(|_| process_entries());
 
         Self::emit_progress(
             &reporter,
@@ -325,10 +345,23 @@ impl FileCrawler {
     }
 
     fn should_skip_path(path: &Path) -> bool {
-        let normalized = path.to_string_lossy().replace('\\', "/");
-        ABNORMAL_PATH_MARKERS
-            .iter()
-            .any(|marker| normalized.contains(marker))
+        let mut matched = 0usize;
+        const DOCKER_VM_PATH: [&str; 5] = ["Library", "Containers", "com.docker.docker", "Data", "vms"];
+
+        for component in path.components() {
+            let Some(part) = component.as_os_str().to_str() else {
+                continue;
+            };
+
+            if part == DOCKER_VM_PATH[matched] {
+                matched += 1;
+                if matched == DOCKER_VM_PATH.len() {
+                    return true;
+                }
+            }
+        }
+
+        false
     }
 }
 
