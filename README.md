@@ -104,6 +104,30 @@ cargo build --release
 cargo test
 ```
 
+### Linux Binary Compatibility
+
+If you see an error like:
+
+```text
+./spaceinsight: /lib/x86_64-linux-gnu/libc.so.6: version `GLIBC_2.39' not found
+```
+
+the binary was built on a newer Linux distribution than your system. Build from source on your machine:
+
+```bash
+cargo build --release
+./target/release/spaceinsight
+```
+
+GitHub Actions now publishes two Linux artifacts:
+
+- `spaceinsight-linux` (standard Linux build on Ubuntu 22.04)
+- `spaceinsight-linux-manylinux` (compatibility build targeting `glibc 2.17`)
+
+Use `spaceinsight-linux-manylinux` if you need maximum distro compatibility.
+
+Windows and macOS workflow outputs are unchanged.
+
 ### Project Structure
 
 ```
