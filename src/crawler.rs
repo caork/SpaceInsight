@@ -26,6 +26,47 @@ pub struct ScanStats {
     pub duration_ms: u128,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanPhase {
+    Discovering,
+    Processing,
+}
+
+#[derive(Debug, Clone)]
+pub struct ScanProgress {
+    pub phase: ScanPhase,
+    pub discovered_entries: u64,
+    pub processed_entries: u64,
+    pub total_entries: Option<u64>,
+    pub total_files: u64,
+    pub total_dirs: u64,
+    pub total_size: u64,
+    pub top_level_preview: Vec<ScanTopLevelPreview>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ScanTopLevelPreview {
+    pub name: String,
+    pub size: u64,
+    pub is_dir: bool,
+}
+
+impl ScanProgress {
+    pub fn fraction(&self) -> Option<f32> {
+        match self.phase {
+            ScanPhase::Discovering => None,
+            ScanPhase::Processing => {
+                let total = self.total_entries?;
+                if total == 0 {
+                    Some(1.0)
+                } else {
+                    Some((self.processed_entries as f32 / total as f32).clamp(0.0, 1.0))
+                }
+            }
+        }
+    }
+}
+
 /// High-performance parallel file system crawler
 pub struct FileCrawler {
     file_count: Arc<AtomicU64>,
@@ -42,19 +83,51 @@ impl FileCrawler {
         }
     }
 
-    /// Scan a directory and build a flat map of all files/directories
-    /// Returns a thread-safe map of path -> FileNode
-    pub fn scan<P: AsRef<Path>>(&mut self, root: P) -> (Arc<DashMap<PathBuf, FileNode>>, ScanStats) {
+    fn emit_progress(
+        reporter: &Option<Arc<dyn Fn(ScanProgress) + Send + Sync>>,
+        progress: ScanProgress,
+    ) {
+        if let Some(cb) = reporter {
+            cb(progress);
+        }
+    }
+
+    fn preview_snapshot(preview_map: &DashMap<String, ScanTopLevelPreview>) -> Vec<ScanTopLevelPreview> {
+        let mut preview_items: Vec<_> = preview_map.iter().map(|entry| entry.value().clone()).collect();
+        preview_items.sort_by(|a, b| b.size.cmp(&a.size));
+        preview_items
+    }
+
+    fn top_level_name(root_path: &Path, path: &Path) -> Option<(String, bool)> {
+        let rel = path.strip_prefix(root_path).ok()?;
+        let mut components = rel.components();
+        let first = components.next()?;
+        let has_more = components.next().is_some();
+        Some((first.as_os_str().to_string_lossy().to_string(), has_more))
+    }
+
+    /// Scan a directory and build a flat map of all files/directories.
+    /// Returns a thread-safe map of path -> FileNode.
+    pub fn scan_with_progress<P: AsRef<Path>>(
+        &mut self,
+        root: P,
+        reporter: Option<Arc<dyn Fn(ScanProgress) + Send + Sync>>,
+    ) -> (Arc<DashMap<PathBuf, FileNode>>, ScanStats) {
+        let root_path = root.as_ref().to_path_buf();
         let start = Instant::now();
         let nodes = Arc::new(DashMap::new());
-        
+        let top_level_preview = Arc::new(DashMap::new());
+
         // Reset counters
         self.file_count.store(0, Ordering::Relaxed);
         self.dir_count.store(0, Ordering::Relaxed);
         self.total_size.store(0, Ordering::Relaxed);
 
-        // Walk directory tree in parallel using jwalk
-        let entries: Vec<_> = WalkDir::new(root.as_ref())
+        // Walk directory tree using jwalk and report discovery progress.
+        let mut entries = Vec::new();
+        let mut discovered_entries = 0u64;
+
+        let walker = WalkDir::new(root.as_ref())
             .skip_hidden(false)
             .parallelism(jwalk::Parallelism::RayonDefaultPool {
                 busy_timeout: std::time::Duration::from_secs(1),
@@ -67,19 +140,109 @@ impl FileCrawler {
                         .unwrap_or(true)
                 });
             })
-            .into_iter()
-            .filter_map(|entry| entry.ok())
-            .collect();
+
+            .into_iter();
+
+        for entry in walker {
+            if let Ok(entry) = entry {
+                discovered_entries = discovered_entries.saturating_add(1);
+                let discovered_path = entry.path();
+                if let Some((name, nested)) = Self::top_level_name(&root_path, &discovered_path) {
+                    let mut preview = top_level_preview
+                        .entry(name.clone())
+                        .or_insert_with(|| ScanTopLevelPreview {
+                            name,
+                            size: 0,
+                            is_dir: nested,
+                        });
+                    if nested {
+                        preview.is_dir = true;
+                    }
+                    preview.size = preview.size.saturating_add(1);
+                }
+
+                if discovered_entries % 128 == 0 {
+                    Self::emit_progress(
+                        &reporter,
+                        ScanProgress {
+                            phase: ScanPhase::Discovering,
+                            discovered_entries,
+                            processed_entries: 0,
+                            total_entries: None,
+                            total_files: self.file_count.load(Ordering::Relaxed),
+                            total_dirs: self.dir_count.load(Ordering::Relaxed),
+                            total_size: self.total_size.load(Ordering::Relaxed),
+                            top_level_preview: Self::preview_snapshot(&top_level_preview),
+                        },
+                    );
+                }
+                entries.push(entry);
+            }
+        }
+
+        let total_entries = entries.len() as u64;
+        Self::emit_progress(
+            &reporter,
+            ScanProgress {
+                phase: ScanPhase::Discovering,
+                discovered_entries,
+                processed_entries: 0,
+                total_entries: Some(total_entries),
+                total_files: self.file_count.load(Ordering::Relaxed),
+                total_dirs: self.dir_count.load(Ordering::Relaxed),
+                total_size: self.total_size.load(Ordering::Relaxed),
+                top_level_preview: Self::preview_snapshot(&top_level_preview),
+            },
+        );
+
+        Self::emit_progress(
+            &reporter,
+            ScanProgress {
+                phase: ScanPhase::Processing,
+                discovered_entries,
+                processed_entries: 0,
+                total_entries: Some(total_entries),
+                total_files: 0,
+                total_dirs: 0,
+                total_size: 0,
+                top_level_preview: Self::preview_snapshot(&top_level_preview),
+            },
+        );
+
+        let processed_entries = Arc::new(AtomicU64::new(0));
+        let reporter_parallel = reporter.clone();
+        let processed_parallel = processed_entries.clone();
+        let file_count = self.file_count.clone();
+        let dir_count = self.dir_count.clone();
+        let total_size = self.total_size.clone();
+        let preview_map = top_level_preview.clone();
+        let root_for_workers = root_path.clone();
 
         // Process entries in parallel using rayon
         entries.par_iter().for_each(|entry| {
+            let processed_now = processed_parallel.fetch_add(1, Ordering::Relaxed) + 1;
+
             let path = entry.path();
             if Self::should_skip_path(&path) {
+                if let Some(cb) = reporter_parallel.as_ref() {
+                    if processed_now % 256 == 0 || processed_now == total_entries {
+                        cb(ScanProgress {
+                            phase: ScanPhase::Processing,
+                            discovered_entries,
+                            processed_entries: processed_now,
+                            total_entries: Some(total_entries),
+                            total_files: file_count.load(Ordering::Relaxed),
+                            total_dirs: dir_count.load(Ordering::Relaxed),
+                            total_size: total_size.load(Ordering::Relaxed),
+                            top_level_preview: Self::preview_snapshot(&preview_map),
+                        });
+                    }
+                }
                 return;
             }
 
             let metadata = entry.metadata().ok();
-            
+
             if let Some(meta) = metadata {
                 let size = meta.len();
                 let is_dir = meta.is_dir();
@@ -91,6 +254,25 @@ impl FileCrawler {
                     self.total_size.fetch_add(size, Ordering::Relaxed);
                 }
 
+                if let Some((name, nested)) = Self::top_level_name(&root_for_workers, &path) {
+                    let bucket_is_dir = nested || is_dir;
+                    let mut entry = preview_map
+                        .entry(name.clone())
+                        .or_insert_with(|| ScanTopLevelPreview {
+                            name,
+                            size: 0,
+                            is_dir: bucket_is_dir,
+                        });
+
+                    if bucket_is_dir {
+                        entry.is_dir = true;
+                    }
+
+                    if !is_dir {
+                        entry.size = entry.size.saturating_add(size.max(1));
+                    }
+                }
+
                 let node = FileNode {
                     path: path.to_path_buf(),
                     size,
@@ -99,7 +281,36 @@ impl FileCrawler {
 
                 nodes.insert(path.to_path_buf(), node);
             }
+
+            if let Some(cb) = reporter_parallel.as_ref() {
+                if processed_now % 256 == 0 || processed_now == total_entries {
+                    cb(ScanProgress {
+                        phase: ScanPhase::Processing,
+                        discovered_entries,
+                        processed_entries: processed_now,
+                        total_entries: Some(total_entries),
+                        total_files: file_count.load(Ordering::Relaxed),
+                        total_dirs: dir_count.load(Ordering::Relaxed),
+                        total_size: total_size.load(Ordering::Relaxed),
+                        top_level_preview: Self::preview_snapshot(&preview_map),
+                    });
+                }
+            }
         });
+
+        Self::emit_progress(
+            &reporter,
+            ScanProgress {
+                phase: ScanPhase::Processing,
+                discovered_entries,
+                processed_entries: total_entries,
+                total_entries: Some(total_entries),
+                total_files: self.file_count.load(Ordering::Relaxed),
+                total_dirs: self.dir_count.load(Ordering::Relaxed),
+                total_size: self.total_size.load(Ordering::Relaxed),
+                top_level_preview: Self::preview_snapshot(&top_level_preview),
+            },
+        );
 
         let duration = start.elapsed();
 
@@ -111,6 +322,11 @@ impl FileCrawler {
         };
 
         (nodes, stats)
+    }
+
+    /// Scan a directory without progress callbacks.
+    pub fn scan<P: AsRef<Path>>(&mut self, root: P) -> (Arc<DashMap<PathBuf, FileNode>>, ScanStats) {
+        self.scan_with_progress(root, None)
     }
 
     fn should_skip_path(path: &Path) -> bool {

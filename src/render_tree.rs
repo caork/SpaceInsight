@@ -31,6 +31,7 @@ const PREFERRED_MAX_ITEMS: usize = 12;
 const MAX_AGGREGATE_FRACTION: f32 = 0.08; // 8%
 
 /// A node in the render tree, produced by build_render_tree.
+#[derive(Clone)]
 pub struct RenderNode {
     pub path: PathBuf,
     pub name: String,

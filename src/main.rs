@@ -1,7 +1,10 @@
 use eframe::egui;
+use notify::{event::ModifyKind, Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
 
@@ -13,7 +16,7 @@ mod tree;
 mod treemap;
 
 use animation::LayoutAnimator;
-use crawler::{FileCrawler, ScanStats};
+use crawler::{FileCrawler, ScanProgress, ScanStats, ScanTopLevelPreview};
 use expand_state::ExpansionState;
 use render_tree::{build_render_tree, RenderNode, BORDER_VISUAL_WIDTH, HEADER_HEIGHT, SIDE_INSET};
 use tree::FileTree;
@@ -28,6 +31,7 @@ const AUTO_JUMP_SENSITIVITY: f32 = 0.0;
 const AUTO_JUMP_MIN_USEFUL_AREA: f32 = 400.0;
 const AUTO_JUMP_MIN_AREA_PCT: f32 = 0.005;
 const AUTO_JUMP_VISIBLE_CAP: usize = 12;
+const LAYOUT_TRANSITION_DURATION: f32 = 0.22;
 
 fn main() -> Result<(), eframe::Error> {
     let options = eframe::NativeOptions {
@@ -87,16 +91,33 @@ enum ClickAction {
     OpenInFileManager { path: PathBuf, is_dir: bool },
 }
 
+enum ScanEvent {
+    Progress(ScanProgress),
+    Completed(ScanResult),
+}
+
+struct LayoutTransition {
+    from_rects: HashMap<u64, Rect>,
+    target_nodes: Vec<RenderNode>,
+    elapsed: f32,
+}
+
 struct SpaceInsightApp {
     scan_path: String,
     is_scanning: bool,
-    scan_result: Arc<Mutex<Option<ScanResult>>>,
+    scan_rx: Option<Receiver<ScanEvent>>,
+    scan_progress: Option<ScanProgress>,
+    scan_preview_items: Vec<TopLevelItem>,
+    watcher: Option<RecommendedWatcher>,
+    watcher_rx: Option<Receiver<notify::Result<Event>>>,
+    watched_root: Option<PathBuf>,
     has_data: bool,
     file_tree: Option<FileTree>,
     root_node_id: Option<indextree::NodeId>,
     view_root_path: Option<PathBuf>,
     expansion_state: ExpansionState,
     render_nodes: Vec<RenderNode>,
+    layout_transition: Option<LayoutTransition>,
     hovered_path: Option<PathBuf>,
     selected_path: Option<PathBuf>,
     // Animation state (initial scan reveal only)
@@ -119,13 +140,19 @@ impl Default for SpaceInsightApp {
         Self {
             scan_path: String::default(),
             is_scanning: false,
-            scan_result: Arc::new(Mutex::new(None)),
+            scan_rx: None,
+            scan_progress: None,
+            scan_preview_items: Vec::new(),
+            watcher: None,
+            watcher_rx: None,
+            watched_root: None,
             has_data: false,
             file_tree: None,
             root_node_id: None,
             view_root_path: None,
             expansion_state: ExpansionState::default(),
             render_nodes: Vec::new(),
+            layout_transition: None,
             hovered_path: None,
             selected_path: None,
             animator: LayoutAnimator::default(),
@@ -144,6 +171,10 @@ struct ScanResult {
 
 impl SpaceInsightApp {
     fn start_scan(&mut self) {
+        self.start_scan_internal();
+    }
+
+    fn start_scan_internal(&mut self) {
         if self.is_scanning {
             return;
         }
@@ -154,12 +185,31 @@ impl SpaceInsightApp {
             self.scan_path.clone()
         };
 
+        self.scan_path = path.clone();
         self.is_scanning = true;
-        let scan_result = self.scan_result.clone();
+        self.scan_preview_items.clear();
+        self.scan_progress = Some(ScanProgress {
+            phase: crawler::ScanPhase::Discovering,
+            discovered_entries: 0,
+            processed_entries: 0,
+            total_entries: None,
+            total_files: 0,
+            total_dirs: 0,
+            total_size: 0,
+            top_level_preview: Vec::new(),
+        });
+
+        let (tx, rx) = mpsc::channel::<ScanEvent>();
+        self.scan_rx = Some(rx);
 
         thread::spawn(move || {
             let mut crawler = FileCrawler::new();
-            let (nodes, stats) = crawler.scan(&path);
+            let progress_tx = tx.clone();
+            let reporter = Arc::new(move |progress: ScanProgress| {
+                let _ = progress_tx.send(ScanEvent::Progress(progress));
+            });
+
+            let (nodes, stats) = crawler.scan_with_progress(&path, Some(reporter));
 
             let mut tree = FileTree::new(&path);
 
@@ -176,36 +226,51 @@ impl SpaceInsightApp {
 
             tree.calculate_sizes();
 
-            *scan_result.lock().unwrap() = Some(ScanResult { tree, stats });
+            let _ = tx.send(ScanEvent::Completed(ScanResult {
+                tree,
+                stats,
+            }));
         });
     }
 
     fn check_scan_result(&mut self, container_rect: egui::Rect) {
-        let scan_complete = if let Ok(mut result_guard) = self.scan_result.try_lock() {
-            if let Some(result) = result_guard.take() {
-                self.is_scanning = false;
-                let root = result.tree.get_root();
-                self.root_node_id = Some(root);
-                self.file_tree = Some(result.tree);
-                self.view_root_path = None;
-                self.expansion_state = ExpansionState::default();
-                self.selected_path = None;
-                true
-            } else {
-                false
-            }
-        } else {
-            false
-        };
+        let mut completed_scan: Option<ScanResult> = None;
+        let mut rx_disconnected = false;
 
-        if scan_complete {
-            self.has_data = true;
-            self.populate_top_level_items();
-            self.start_initial_animation(container_rect);
+        if let Some(rx) = self.scan_rx.as_ref() {
+            loop {
+                match rx.try_recv() {
+                    Ok(ScanEvent::Progress(progress)) => {
+                        self.scan_preview_items = Self::preview_to_top_level_items(&progress.top_level_preview);
+                        self.scan_progress = Some(progress);
+                    }
+                    Ok(ScanEvent::Completed(result)) => {
+                        completed_scan = Some(result);
+                    }
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        rx_disconnected = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if rx_disconnected {
+            self.scan_rx = None;
+            self.is_scanning = false;
+        }
+
+        if let Some(result) = completed_scan {
+            self.scan_rx = None;
+            self.is_scanning = false;
+            self.scan_progress = None;
+            self.scan_preview_items.clear();
+            self.apply_scan_result(result, container_rect);
         }
 
         // Recompute render tree if container size changed
-        if self.has_data && !self.animator.is_animating {
+        if self.has_data && !self.animator.is_animating && self.layout_transition.is_none() {
             let needs_recompute = match self.last_container_rect {
                 Some(prev) => {
                     (prev.width() - container_rect.width()).abs() > 1.0
@@ -217,6 +282,328 @@ impl SpaceInsightApp {
             };
             if needs_recompute {
                 self.rebuild_render_tree(container_rect);
+            }
+        }
+    }
+
+    fn apply_scan_result(&mut self, result: ScanResult, container_rect: egui::Rect) {
+        self.has_data = true;
+        let root = result.tree.get_root();
+        self.root_node_id = Some(root);
+        self.file_tree = Some(result.tree);
+
+        self.view_root_path = None;
+        self.expansion_state = ExpansionState::default();
+        self.selected_path = None;
+        self.hovered_path = None;
+        self.render_nodes.clear();
+        self.layout_transition = None;
+        self.populate_top_level_items();
+        self.start_initial_animation(container_rect);
+        self.install_file_watcher();
+    }
+
+    fn install_file_watcher(&mut self) {
+        let Some(tree) = self.file_tree.as_ref() else {
+            return;
+        };
+        let Some(root_path) = tree.root_path().map(|p| p.to_path_buf()) else {
+            return;
+        };
+
+        if self.watched_root.as_ref() == Some(&root_path) && self.watcher.is_some() {
+            return;
+        }
+
+        let (tx, rx) = mpsc::channel();
+        let mut watcher = match RecommendedWatcher::new(
+            move |res| {
+                let _ = tx.send(res);
+            },
+            Config::default(),
+        ) {
+            Ok(w) => w,
+            Err(_) => {
+                self.watcher = None;
+                self.watcher_rx = None;
+                self.watched_root = None;
+                return;
+            }
+        };
+
+        if watcher.watch(&root_path, RecursiveMode::Recursive).is_ok() {
+            self.watcher = Some(watcher);
+            self.watcher_rx = Some(rx);
+            self.watched_root = Some(root_path);
+        } else {
+            self.watcher = None;
+            self.watcher_rx = None;
+            self.watched_root = None;
+        }
+    }
+
+    fn consume_file_events(&mut self, container_rect: egui::Rect) {
+        if self.is_scanning {
+            return;
+        }
+
+        let mut disconnected = false;
+        let mut changed = false;
+        let mut pending_events = Vec::new();
+
+        if let Some(rx) = self.watcher_rx.as_ref() {
+            loop {
+                match rx.try_recv() {
+                    Ok(Ok(event)) => {
+                        pending_events.push(event);
+                    }
+                    Ok(Err(_)) => {}
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        for event in pending_events {
+            changed |= self.apply_fs_event(event);
+        }
+
+        if disconnected {
+            self.watcher = None;
+            self.watcher_rx = None;
+            self.watched_root = None;
+        }
+
+        if changed {
+            if let Some(tree) = self.file_tree.as_mut() {
+                tree.calculate_sizes();
+            }
+            self.prune_view_state_after_diff();
+            self.populate_top_level_items();
+            self.rebuild_render_tree(container_rect);
+        }
+    }
+
+    fn apply_fs_event(&mut self, event: Event) -> bool {
+        let mut changed = false;
+
+        match event.kind {
+            EventKind::Create(_) => {
+                for path in event.paths {
+                    if let Some(meta) = std::fs::metadata(&path).ok() {
+                        changed |= self.apply_upsert_path(path, &meta);
+                    }
+                }
+            }
+            EventKind::Remove(_) => {
+                for path in event.paths {
+                    changed |= self.apply_remove_path(path.as_path());
+                }
+            }
+            EventKind::Modify(ModifyKind::Name(_)) => {
+                if event.paths.len() >= 2 {
+                    let from = &event.paths[0];
+                    let to = &event.paths[1];
+                    changed |= self.apply_remove_path(from.as_path());
+                    if let Some(meta) = std::fs::metadata(to).ok() {
+                        changed |= self.apply_upsert_path(to.clone(), &meta);
+                    }
+                } else {
+                    for path in event.paths {
+                        if let Some(meta) = std::fs::metadata(&path).ok() {
+                            changed |= self.apply_upsert_path(path, &meta);
+                        } else {
+                            changed |= self.apply_remove_path(path.as_path());
+                        }
+                    }
+                }
+            }
+            EventKind::Modify(_) => {
+                for path in event.paths {
+                    if let Some(meta) = std::fs::metadata(&path).ok() {
+                        changed |= self.apply_upsert_path(path, &meta);
+                    } else {
+                        changed |= self.apply_remove_path(path.as_path());
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        changed
+    }
+
+    fn apply_upsert_path(&mut self, path: PathBuf, meta: &std::fs::Metadata) -> bool {
+        let Some(tree) = self.file_tree.as_mut() else {
+            return false;
+        };
+
+        let Some(root) = tree.root_path() else {
+            return false;
+        };
+        if !path.starts_with(root) {
+            return false;
+        }
+
+        let size = if meta.is_file() { meta.len() } else { 0 };
+        let is_dir = meta.is_dir();
+
+        tree.upsert_node(path, size, is_dir);
+        true
+    }
+
+    fn apply_remove_path(&mut self, path: &Path) -> bool {
+        let Some(tree) = self.file_tree.as_mut() else {
+            return false;
+        };
+
+        let Some(root) = tree.root_path() else {
+            return false;
+        };
+        if !path.starts_with(root) {
+            return false;
+        }
+
+        tree.remove_path_recursive(path)
+    }
+
+    fn prune_view_state_after_diff(&mut self) {
+        let Some(tree) = self.file_tree.as_ref() else {
+            return;
+        };
+
+        self.expansion_state
+            .retain_paths(|path| tree.get_node(path).is_some());
+
+        if let Some(path) = self.selected_path.clone() {
+            if tree.get_node(&path).is_none() {
+                self.selected_path = None;
+            }
+        }
+
+        if let Some(path) = self.hovered_path.clone() {
+            if tree.get_node(&path).is_none() {
+                self.hovered_path = None;
+            }
+        }
+
+        if let Some(path) = self.view_root_path.clone() {
+            if tree.get_node(&path).is_none() {
+                self.view_root_path = None;
+            }
+        }
+    }
+
+    fn preview_to_top_level_items(preview: &[ScanTopLevelPreview]) -> Vec<TopLevelItem> {
+        let mut items: Vec<TopLevelItem> = preview
+            .iter()
+            .map(|item| TopLevelItem {
+                name: item.name.clone(),
+                size: item.size,
+                is_dir: item.is_dir,
+            })
+            .collect();
+
+        items.sort_by(|a, b| b.size.cmp(&a.size));
+        items
+    }
+
+    fn render_live_scan_preview(
+        &self,
+        ui: &mut egui::Ui,
+        painter: &egui::Painter,
+        available_rect: egui::Rect,
+    ) {
+        if self.scan_preview_items.is_empty() {
+            return;
+        }
+
+        let items: Vec<TreemapItem> = self
+            .scan_preview_items
+            .iter()
+            .enumerate()
+            .filter_map(|(index, item)| {
+                if item.size == 0 {
+                    None
+                } else {
+                    Some(TreemapItem { size: item.size, index })
+                }
+            })
+            .collect();
+
+        if items.is_empty() {
+            return;
+        }
+
+        let padded = Self::padded_container(available_rect);
+        let container = Rect::new(padded.min.x, padded.min.y, padded.width(), padded.height());
+        let layout = SquarifiedTreemap::layout(&items, container);
+        let total_size: u64 = self.scan_preview_items.iter().map(|item| item.size).sum();
+
+        for layout_rect in layout {
+            let Some(item) = self.scan_preview_items.get(layout_rect.index) else {
+                continue;
+            };
+
+            let px = layout_rect.rect.x + TILE_GUTTER;
+            let py = layout_rect.rect.y + TILE_GUTTER;
+            let pw = (layout_rect.rect.width - 2.0 * TILE_GUTTER).max(1.0);
+            let ph = (layout_rect.rect.height - 2.0 * TILE_GUTTER).max(1.0);
+
+            let egui_rect = egui::Rect::from_min_size(egui::pos2(px, py), egui::vec2(pw, ph));
+
+            let size_ratio = if total_size > 0 {
+                item.size as f32 / total_size as f32
+            } else {
+                0.0
+            };
+
+            let color = Self::get_temperature_color(size_ratio, false);
+            let corner_radius = (pw.min(ph) * 0.06).min(TILE_CORNER_MAX);
+
+            painter.rect(
+                egui_rect,
+                corner_radius,
+                color,
+                egui::Stroke::new(
+                    if item.is_dir {
+                        TILE_BORDER_WIDTH_DIR
+                    } else {
+                        TILE_BORDER_WIDTH_FILE
+                    },
+                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 60),
+                ),
+            );
+
+            let area = pw * ph;
+            if area > 2500.0 {
+                let label = if item.is_dir {
+                    format!("+ {}", item.name)
+                } else {
+                    item.name.clone()
+                };
+                let _ = Self::draw_centered_two_line_label(
+                    painter,
+                    egui_rect,
+                    &label,
+                    12.0,
+                    &Self::format_size(item.size),
+                    10.0,
+                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 230),
+                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 170),
+                );
+            }
+
+            let response = ui.interact(
+                egui_rect,
+                ui.id().with("scan_preview").with(layout_rect.index),
+                egui::Sense::hover(),
+            );
+            if response.hovered() {
+                response.on_hover_text(format!("{} ({})", item.name, Self::format_size(item.size)));
             }
         }
     }
@@ -273,14 +660,93 @@ impl SpaceInsightApp {
             let padded = Self::padded_container(container_rect);
             let container = Rect::new(padded.min.x, padded.min.y, padded.width(), padded.height());
 
-            self.render_nodes = build_render_tree(
+            let next_nodes = build_render_tree(
                 tree,
                 root_id,
                 container,
                 &self.expansion_state,
                 usize::MAX,
             );
+
+            if self.render_nodes.is_empty() || next_nodes.is_empty() {
+                self.layout_transition = None;
+                self.render_nodes = next_nodes;
+                return;
+            }
+
+            let from_rects = self.collect_current_rects();
+            self.layout_transition = Some(LayoutTransition {
+                from_rects,
+                target_nodes: next_nodes.clone(),
+                elapsed: 0.0,
+            });
+            self.render_nodes = next_nodes;
         }
+    }
+
+    fn collect_current_rects(&self) -> HashMap<u64, Rect> {
+        let mut rects = HashMap::new();
+        if let Some(transition) = &self.layout_transition {
+            let mut nodes = transition.target_nodes.clone();
+            let t = (transition.elapsed / LAYOUT_TRANSITION_DURATION).clamp(0.0, 1.0);
+            Self::apply_transition_to_nodes(&mut nodes, &transition.from_rects, t);
+            Self::collect_rects_recursive(&nodes, &mut rects);
+        } else {
+            Self::collect_rects_recursive(&self.render_nodes, &mut rects);
+        }
+        rects
+    }
+
+    fn collect_rects_recursive(nodes: &[RenderNode], out: &mut HashMap<u64, Rect>) {
+        for node in nodes {
+            out.insert(node.stable_id, node.outer_rect);
+            if !node.children.is_empty() {
+                Self::collect_rects_recursive(&node.children, out);
+            }
+        }
+    }
+
+    fn current_display_nodes(&self) -> Vec<RenderNode> {
+        if let Some(transition) = &self.layout_transition {
+            let mut nodes = transition.target_nodes.clone();
+            let t = (transition.elapsed / LAYOUT_TRANSITION_DURATION).clamp(0.0, 1.0);
+            Self::apply_transition_to_nodes(&mut nodes, &transition.from_rects, t);
+            nodes
+        } else {
+            self.render_nodes.clone()
+        }
+    }
+
+    fn apply_transition_to_nodes(nodes: &mut [RenderNode], from_rects: &HashMap<u64, Rect>, t: f32) {
+        for node in nodes {
+            if let Some(from) = from_rects.get(&node.stable_id) {
+                node.outer_rect = Self::lerp_rect(*from, node.outer_rect, t);
+            }
+            if !node.children.is_empty() {
+                Self::apply_transition_to_nodes(&mut node.children, from_rects, t);
+            }
+        }
+    }
+
+    fn lerp_rect(from: Rect, to: Rect, t: f32) -> Rect {
+        Rect {
+            x: from.x + (to.x - from.x) * t,
+            y: from.y + (to.y - from.y) * t,
+            width: from.width + (to.width - from.width) * t,
+            height: from.height + (to.height - from.height) * t,
+        }
+    }
+
+    fn update_layout_transition(&mut self, dt: f32) -> bool {
+        if let Some(transition) = self.layout_transition.as_mut() {
+            transition.elapsed += dt;
+            if transition.elapsed >= LAYOUT_TRANSITION_DURATION {
+                self.layout_transition = None;
+                return false;
+            }
+            return true;
+        }
+        false
     }
 
     fn active_root_node_id(&self) -> Option<indextree::NodeId> {
@@ -307,6 +773,16 @@ impl SpaceInsightApp {
         } else {
             self.scan_path.clone()
         }
+    }
+
+    fn current_root_size(&self) -> Option<u64> {
+        let (Some(tree), Some(active_root_id)) = (&self.file_tree, self.active_root_node_id()) else {
+            return None;
+        };
+
+        tree.get_arena()
+            .get(active_root_id)
+            .map(|node| node.get().cumulative_size)
     }
 
     fn step_out_view_root(&mut self) {
@@ -777,6 +1253,83 @@ impl SpaceInsightApp {
         mesh
     }
 
+    fn draw_scan_progress_circle(ui: &mut egui::Ui, progress: Option<&ScanProgress>) {
+        let desired = egui::vec2(32.0, 32.0);
+        let (rect, response) = ui.allocate_exact_size(desired, egui::Sense::hover());
+        let painter = ui.painter_at(rect);
+
+        let center = rect.center();
+        let radius = rect.width().min(rect.height()) * 0.5 - 2.0;
+
+        painter.circle_stroke(
+            center,
+            radius,
+            egui::Stroke::new(2.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 45)),
+        );
+
+        let (start, end, label) = if let Some(scan_progress) = progress {
+            if let Some(frac) = scan_progress.fraction() {
+                let clamped = frac.clamp(0.0, 1.0);
+                let end = -std::f32::consts::FRAC_PI_2 + std::f32::consts::TAU * clamped;
+                (
+                    -std::f32::consts::FRAC_PI_2,
+                    end,
+                    format!("{}%", (clamped * 100.0).round() as u8),
+                )
+            } else {
+                let time = ui.input(|i| i.time) as f32;
+                let start = -std::f32::consts::FRAC_PI_2 + time * 2.4;
+                let end = start + std::f32::consts::PI * 1.25;
+                (start, end, "…".to_string())
+            }
+        } else {
+            (
+                -std::f32::consts::FRAC_PI_2,
+                -std::f32::consts::FRAC_PI_2,
+                "0%".to_string(),
+            )
+        };
+
+        let sweep = (end - start).abs();
+        if sweep > 0.0001 {
+            let segments = ((sweep / std::f32::consts::TAU) * 64.0).ceil().max(8.0) as usize;
+            let mut points = Vec::with_capacity(segments + 1);
+            for i in 0..=segments {
+                let t = i as f32 / segments as f32;
+                let angle = start + (end - start) * t;
+                points.push(egui::pos2(
+                    center.x + angle.cos() * radius,
+                    center.y + angle.sin() * radius,
+                ));
+            }
+
+            painter.add(egui::Shape::line(
+                points,
+                egui::Stroke::new(3.0, egui::Color32::from_rgb(45, 212, 191)),
+            ));
+        }
+
+        painter.text(
+            center,
+            egui::Align2::CENTER_CENTER,
+            label,
+            egui::FontId::proportional(10.0),
+            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 210),
+        );
+
+        if let Some(scan_progress) = progress {
+            let tooltip = if let Some(total) = scan_progress.total_entries {
+                format!(
+                    "Scanning {} / {} entries",
+                    scan_progress.processed_entries, total
+                )
+            } else {
+                format!("Discovering entries: {}", scan_progress.discovered_entries)
+            };
+            response.on_hover_text(tooltip);
+        }
+    }
+
     /// Recursively render nodes and collect any click action.
     fn render_nodes_recursive(
         nodes: &[RenderNode],
@@ -1194,9 +1747,11 @@ impl eframe::App for SpaceInsightApp {
 
         // Update animation
         let still_animating = self.animator.update(dt);
+        let layout_transition_active = self.update_layout_transition(dt);
 
         // If animation just finished, build the render tree
-        let animation_just_finished = !still_animating && !self.animator.is_animating && self.has_data && self.render_nodes.is_empty();
+        let animation_just_finished =
+            !still_animating && !self.animator.is_animating && self.has_data && self.render_nodes.is_empty();
 
         egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -1217,8 +1772,30 @@ impl eframe::App for SpaceInsightApp {
                 }
 
                 if self.is_scanning {
-                    ui.spinner();
-                    ui.label("Scanning...");
+                    Self::draw_scan_progress_circle(ui, self.scan_progress.as_ref());
+                    if let Some(progress) = &self.scan_progress {
+                        if let Some(fraction) = progress.fraction() {
+                            ui.label(format!(
+                                "Scanning... {} / {} ({:.0}%)",
+                                progress.processed_entries,
+                                progress.total_entries.unwrap_or_default(),
+                                fraction * 100.0,
+                            ));
+                        } else {
+                            ui.label(format!(
+                                "Scanning... discovering {} entries",
+                                progress.discovered_entries
+                            ));
+                        }
+                        ui.label(format!(
+                            "Files: {}  Dirs: {}  Size: {}",
+                            progress.total_files,
+                            progress.total_dirs,
+                            Self::format_size(progress.total_size)
+                        ));
+                    } else {
+                        ui.label("Scanning...");
+                    }
                 }
 
                 if self.has_data {
@@ -1241,6 +1818,10 @@ impl eframe::App for SpaceInsightApp {
                         }
                     }
                     ui.label(format!("Root: {}", self.current_root_label()));
+                    if let Some(size) = self.current_root_size() {
+                        ui.separator();
+                        ui.label(format!("Folder Size: {}", Self::format_size(size)));
+                    }
                     if let Some(ref hovered) = self.hovered_path {
                         ui.separator();
                         ui.label(format!("{}", hovered.display()));
@@ -1251,6 +1832,8 @@ impl eframe::App for SpaceInsightApp {
 
         egui::CentralPanel::default().show(ctx, |ui| {
             let available_rect = ui.available_rect_before_wrap();
+
+            self.consume_file_events(available_rect);
 
             self.check_scan_result(available_rect);
 
@@ -1277,72 +1860,76 @@ impl eframe::App for SpaceInsightApp {
                         self.rebuild_render_tree(available_rect);
                     }
                 }
-            } else if !self.render_nodes.is_empty() {
-                // Normal recursive rendering
-                let total_size = if let Some(tree) = &self.file_tree {
-                    tree.total_size()
-                } else {
-                    0
-                };
-                let min_label_area = self.animator.tier.min_label_area();
+            } else if self.is_scanning {
+                self.render_live_scan_preview(ui, &painter, available_rect);
+            } else {
+                let display_nodes = self.current_display_nodes();
 
-                let action = Self::render_nodes_recursive(
-                    &self.render_nodes,
-                    ui,
-                    &painter,
-                    total_size,
-                    &self.selected_path,
-                    &mut new_hovered_path,
-                    min_label_area,
-                );
+                if !display_nodes.is_empty() {
+                    // Normal recursive rendering
+                    let total_size = if let Some(tree) = &self.file_tree {
+                        tree.total_size()
+                    } else {
+                        0
+                    };
+                    let min_label_area = self.animator.tier.min_label_area();
 
-                // Process click action
-                if let Some(act) = action {
-                    match act {
-                        ClickAction::Expand(path) => {
-                            if self.maybe_zoom_into_folder(&path, available_rect) {
-                                self.selected_path = None;
-                            } else {
-                                if !self.expansion_state.is_expanded(&path) {
+                    let action = Self::render_nodes_recursive(
+                        &display_nodes,
+                        ui,
+                        &painter,
+                        total_size,
+                        &self.selected_path,
+                        &mut new_hovered_path,
+                        min_label_area,
+                    );
+
+                    // Process click action
+                    if let Some(act) = action {
+                        match act {
+                            ClickAction::Expand(path) => {
+                                if self.maybe_zoom_into_folder(&path, available_rect) {
+                                    self.selected_path = None;
+                                } else if !self.expansion_state.is_expanded(&path) {
                                     self.expansion_state.expand(&path);
                                 }
+                                self.rebuild_render_tree(available_rect);
                             }
-                            self.rebuild_render_tree(available_rect);
-                        }
-                        ClickAction::Deepen(path) => {
-                            if self.maybe_zoom_into_folder(&path, available_rect) {
-                                self.selected_path = None;
-                            } else {
-                                // Double-click: expand this folder AND its child folders
-                                self.expansion_state.deepen(&path);
-                                if let Some(tree) = &self.file_tree {
-                                    if let Some(node_id) = tree.get_node(&path) {
-                                        let arena = tree.get_arena();
-                                        for child_id in node_id.children(arena) {
-                                            if let Some(child_node) = arena.get(child_id) {
-                                                let child_data = child_node.get();
-                                                if child_data.is_dir {
-                                                    self.expansion_state.expand(&child_data.path);
+                            ClickAction::Deepen(path) => {
+                                if self.maybe_zoom_into_folder(&path, available_rect) {
+                                    self.selected_path = None;
+                                } else {
+                                    // Double-click: expand this folder AND its child folders
+                                    self.expansion_state.deepen(&path);
+                                    if let Some(tree) = &self.file_tree {
+                                        if let Some(node_id) = tree.get_node(&path) {
+                                            let arena = tree.get_arena();
+                                            for child_id in node_id.children(arena) {
+                                                if let Some(child_node) = arena.get(child_id) {
+                                                    let child_data = child_node.get();
+                                                    if child_data.is_dir {
+                                                        self.expansion_state.expand(&child_data.path);
+                                                    }
                                                 }
                                             }
                                         }
                                     }
                                 }
+                                self.rebuild_render_tree(available_rect);
                             }
-                            self.rebuild_render_tree(available_rect);
-                        }
-                        ClickAction::Collapse(path) => {
-                            self.expansion_state.collapse_recursive(&path);
-                            self.rebuild_render_tree(available_rect);
-                        }
-                        ClickAction::SelectFile(path) => {
-                            self.selected_path = Some(path);
-                        }
-                        ClickAction::OpenPath(path) => {
-                            Self::open_path(&path);
-                        }
-                        ClickAction::OpenInFileManager { path, is_dir } => {
-                            Self::open_in_file_manager(&path, is_dir);
+                            ClickAction::Collapse(path) => {
+                                self.expansion_state.collapse_recursive(&path);
+                                self.rebuild_render_tree(available_rect);
+                            }
+                            ClickAction::SelectFile(path) => {
+                                self.selected_path = Some(path);
+                            }
+                            ClickAction::OpenPath(path) => {
+                                Self::open_path(&path);
+                            }
+                            ClickAction::OpenInFileManager { path, is_dir } => {
+                                Self::open_in_file_manager(&path, is_dir);
+                            }
                         }
                     }
                 }
@@ -1350,7 +1937,11 @@ impl eframe::App for SpaceInsightApp {
 
             self.hovered_path = new_hovered_path;
 
-            if self.is_scanning || still_animating || self.animator.is_animating {
+            if self.is_scanning
+                || still_animating
+                || self.animator.is_animating
+                || layout_transition_active
+            {
                 ctx.request_repaint();
             }
         });

@@ -10,6 +10,7 @@ rayon = "1.8"    # Multi-threading
 indextree = "4.6" # High-perf Arena tree
 dashmap = "6.1"  # Thread-safe HashMap
 serde = { version = "1.0", features = ["derive"] }
+notify = "8.0"
 
 [profile.release]
 lto = "fat"         # Heavy optimization

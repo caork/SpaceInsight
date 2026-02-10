@@ -52,6 +52,15 @@ impl ExpansionState {
     pub fn collapse_all(&mut self) {
         self.expanded.clear();
     }
+
+    /// Retain only paths that satisfy the predicate.
+    pub fn retain_paths<F>(&mut self, mut keep: F)
+    where
+        F: FnMut(&Path) -> bool,
+    {
+        self.expanded.retain(|path, _| keep(path));
+    }
+
 }
 
 #[cfg(test)]

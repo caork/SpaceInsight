@@ -122,6 +122,139 @@ impl FileTree {
         self.path_to_node.get(path).copied()
     }
 
+    pub fn root_path(&self) -> Option<&Path> {
+        self.arena.get(self.root).map(|n| n.get().path.as_path())
+    }
+
+    fn ensure_directory_node(&mut self, path: &Path) -> Option<NodeId> {
+        if let Some(node_id) = self.path_to_node.get(path).copied() {
+            return Some(node_id);
+        }
+
+        let root_path = self.root_path()?.to_path_buf();
+        if !path.starts_with(&root_path) {
+            return None;
+        }
+
+        if path == root_path {
+            return Some(self.root);
+        }
+
+        let parent_path = path.parent()?;
+        let parent_id = self.ensure_directory_node(parent_path)?;
+
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_string();
+
+        let node_id = self.arena.new_node(TreeNode {
+            path: path.to_path_buf(),
+            name,
+            size: 0,
+            is_dir: true,
+            cumulative_size: 0,
+        });
+
+        parent_id.append(node_id, &mut self.arena);
+        self.path_to_node.insert(path.to_path_buf(), node_id);
+        Some(node_id)
+    }
+
+    pub fn upsert_node(&mut self, path: PathBuf, size: u64, is_dir: bool) {
+        if self
+            .root_path()
+            .map(|root| path == root)
+            .unwrap_or(false)
+        {
+            return;
+        }
+
+        let Some(root_path) = self.root_path().map(|p| p.to_path_buf()) else {
+            return;
+        };
+        if !path.starts_with(&root_path) {
+            return;
+        }
+
+        if is_dir {
+            if let Some(node_id) = self.ensure_directory_node(&path) {
+                if let Some(node) = self.arena.get_mut(node_id) {
+                    let data = node.get_mut();
+                    data.is_dir = true;
+                    data.size = 0;
+                }
+            }
+            return;
+        }
+
+        let Some(parent_path) = path.parent() else {
+            return;
+        };
+        let Some(parent_id) = self.ensure_directory_node(parent_path) else {
+            return;
+        };
+
+        if let Some(node_id) = self.path_to_node.get(&path).copied() {
+            if let Some(node) = self.arena.get_mut(node_id) {
+                let data = node.get_mut();
+                data.is_dir = false;
+                data.size = size;
+                data.cumulative_size = size;
+            }
+            return;
+        }
+
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_string();
+
+        let node_id = self.arena.new_node(TreeNode {
+            path: path.clone(),
+            name,
+            size,
+            is_dir: false,
+            cumulative_size: size,
+        });
+
+        parent_id.append(node_id, &mut self.arena);
+        self.path_to_node.insert(path, node_id);
+    }
+
+    pub fn remove_path_recursive(&mut self, path: &Path) -> bool {
+        let Some(root_path) = self.root_path().map(|p| p.to_path_buf()) else {
+            return false;
+        };
+        if path == root_path {
+            return false;
+        }
+
+        let Some(node_id) = self.path_to_node.get(path).copied() else {
+            return false;
+        };
+
+        let mut stack = vec![node_id];
+        let mut ids = Vec::new();
+        while let Some(id) = stack.pop() {
+            ids.push(id);
+            for child in id.children(&self.arena) {
+                stack.push(child);
+            }
+        }
+
+        for id in ids {
+            if let Some(node) = self.arena.get(id) {
+                self.path_to_node.remove(&node.get().path);
+            }
+        }
+
+        node_id.detach(&mut self.arena);
+        true
+    }
+
     /// Get total size of the tree
     pub fn total_size(&self) -> u64 {
         self.arena
