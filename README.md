@@ -150,16 +150,16 @@ cargo build --release
 ./target/release/spaceinsight-tui
 ```
 
-GitHub Actions now publishes Linux artifacts for both binaries:
+GitHub Actions now publishes architecture-specific artifacts:
 
-- `spaceinsight-linux` (GUI, standard Linux build on Ubuntu 22.04)
-- `spaceinsight-tui-linux` (TUI, standard Linux build on Ubuntu 22.04)
-- `spaceinsight-linux-manylinux` (GUI, compatibility build targeting `glibc 2.17`)
-- `spaceinsight-tui-linux-manylinux` (TUI, compatibility build targeting `glibc 2.17`)
+- `spaceinsight-linux-<x86_64|arm64>` (GUI, standard Linux build on Ubuntu 22.04)
+- `spaceinsight-windows-<x86_64|arm64>` (GUI, standard Windows build)
+- `spaceinsight-macos-<x86_64|arm64>` (GUI, standard macOS build)
+- `spaceinsight-tui-linux-<x86_64|arm64>` (TUI, Linux only)
+- `spaceinsight-linux-x86_64-manylinux` (GUI, compatibility build targeting `glibc 2.17`)
+- `spaceinsight-tui-linux-x86_64-manylinux` (TUI, compatibility build targeting `glibc 2.17`, Linux only)
 
-Use `spaceinsight-linux-manylinux` if you need maximum distro compatibility.
-
-Windows and macOS workflow outputs are unchanged.
+Use `spaceinsight-linux-x86_64-manylinux` if you need maximum distro compatibility.
 
 ### Project Structure
 
