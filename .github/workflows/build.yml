@@ -31,7 +31,7 @@ jobs:
             arch_label: aarch64
             exe_suffix: .exe
           - os_name: macos
-            runs_on: macos-13
+            runs_on: macos-15-intel
             arch_label: x86_64
             exe_suffix: ""
           - os_name: macos

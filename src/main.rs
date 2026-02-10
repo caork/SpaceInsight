@@ -1323,14 +1323,19 @@ impl SpaceInsightApp {
         nodes: &[RenderNode],
         ui: &mut egui::Ui,
         painter: &egui::Painter,
-        total_size: u64,
         selected_path: &Option<PathBuf>,
         hovered_path: &mut Option<PathBuf>,
         min_label_area: f32,
     ) -> Option<ClickAction> {
         let mut action: Option<ClickAction> = None;
+        let level_total_size: u64 = nodes.iter().map(|node| node.size).sum();
 
         for node in nodes {
+            let size_ratio = if level_total_size > 0 {
+                node.size as f32 / level_total_size as f32
+            } else {
+                0.0
+            };
             let is_expanded = node.content_rect.is_some();
 
             if is_expanded {
@@ -1408,7 +1413,6 @@ impl SpaceInsightApp {
                         &node.children,
                         ui,
                         painter,
-                        total_size,
                         selected_path,
                         hovered_path,
                         min_label_area,
@@ -1513,12 +1517,6 @@ impl SpaceInsightApp {
                     }
                 } else {
                     // --- Normal file/folder block ---
-                    let size_ratio = if total_size > 0 {
-                        node.size as f32 / total_size as f32
-                    } else {
-                        0.0
-                    };
-
                     let base_color = Self::get_temperature_color(size_ratio, is_hovered);
 
                     // Shadow
@@ -1855,18 +1853,12 @@ impl eframe::App for SpaceInsightApp {
 
                 if !display_nodes.is_empty() {
                     // Normal recursive rendering
-                    let total_size = if let Some(tree) = &self.file_tree {
-                        tree.total_size()
-                    } else {
-                        0
-                    };
                     let min_label_area = self.animator.tier.min_label_area();
 
                     let action = Self::render_nodes_recursive(
                         &display_nodes,
                         ui,
                         &painter,
-                        total_size,
                         &self.selected_path,
                         &mut new_hovered_path,
                         min_label_area,
