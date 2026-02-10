@@ -1,5 +1,7 @@
 # SpaceInsight 🚀
 
+![SpaceInsight](img/spaceInsight.jpg)
+
 A blazingly fast, GPU-accelerated disk space analyzer built in Rust. Designed to outperform SpaceSniffer with multi-threaded scanning and real-time treemap visualization.
 
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
