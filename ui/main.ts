@@ -181,6 +181,10 @@ function shortName(path: string): string {
   return parts.at(-1) || path;
 }
 
+function displayPath(path: string): string {
+  return path.replace(/^(?:\\\\|\/\/)\?(?:\\|\/)/, "");
+}
+
 function showToast(message: unknown): void {
   toast.textContent = String(message);
   toast.hidden = false;
@@ -538,7 +542,7 @@ new ResizeObserver(() => {
 void listen<ScanProgress>("scan-progress", ({ payload }) => void renderProgress(payload));
 void listen<ScanComplete>("scan-complete", async ({ payload }) => {
   setScanning(false);
-  pathInput.value = payload.root;
+  pathInput.value = displayPath(payload.root);
   el("scan-track-fill").style.width = "100%";
   el("status-text").textContent = `Scanned in ${(payload.durationMs / 1000).toFixed(2)}s`;
   try {
