@@ -1,5 +1,7 @@
 # SpaceInsight
 
+![SpaceInsight](img/spaceInsight.jpg)
+
 SpaceInsight is a fast, cross-platform disk space analyzer. Its Rust scanning
 engine is paired with a Tauri desktop interface and an optional terminal UI.
 
