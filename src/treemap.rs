@@ -29,7 +29,12 @@ pub struct Rect {
 
 impl Rect {
     pub fn new(x: f32, y: f32, width: f32, height: f32) -> Self {
-        Self { x, y, width, height }
+        Self {
+            x,
+            y,
+            width,
+            height,
+        }
     }
 
     pub fn area(&self) -> f32 {
@@ -108,51 +113,43 @@ impl SquarifiedTreemap {
         }
 
         let mut current_row = Vec::new();
-        let mut remaining = items.to_vec();
+        let mut remaining_container = container;
+        let mut next_index = 0usize;
 
-        Self::squarify_recursive(&mut remaining, &mut current_row, result, container);
-    }
-
-    fn squarify_recursive(
-        remaining: &mut Vec<(usize, f32)>,
-        current_row: &mut Vec<(usize, f32)>,
-        result: &mut Vec<LayoutRect>,
-        container: Rect,
-    ) {
-        if remaining.is_empty() {
-            if !current_row.is_empty() {
-                // Last row: no remaining items, direction doesn't affect future layout
-                Self::emit_row(current_row, result, container, container.width >= container.height);
-                current_row.clear();
+        while next_index < items.len() {
+            let next = items[next_index];
+            if current_row.is_empty() {
+                current_row.push(next);
+                next_index += 1;
+                continue;
             }
-            return;
-        }
 
-        let next = remaining[0];
-
-        if current_row.is_empty() {
-            current_row.push(next);
-            remaining.remove(0);
-            Self::squarify_recursive(remaining, current_row, result, container);
-        } else {
-            let current_score = Self::best_row_score(current_row, container);
+            let current_score = Self::best_row_score(&current_row, remaining_container);
             let mut test_row = current_row.clone();
             test_row.push(next);
-            let test_score = Self::best_row_score(&test_row, container);
+            let test_score = Self::best_row_score(&test_row, remaining_container);
 
             if test_score <= current_score * ROW_GROWTH_TOLERANCE {
                 current_row.push(next);
-                remaining.remove(0);
-                Self::squarify_recursive(remaining, current_row, result, container);
+                next_index += 1;
             } else {
-                // Finalize this row: pick the best split direction
                 let row_total: f32 = current_row.iter().map(|(_, size)| size).sum();
-                let horizontal = Self::pick_direction(current_row, container, row_total);
-                let new_container = Self::compute_remaining(container, row_total, horizontal);
-                Self::emit_row(current_row, result, container, horizontal);
+                let horizontal = Self::pick_direction(&current_row, remaining_container, row_total);
+                let new_container =
+                    Self::compute_remaining(remaining_container, row_total, horizontal);
+                Self::emit_row(&current_row, result, remaining_container, horizontal);
                 current_row.clear();
-                Self::squarify_recursive(remaining, current_row, result, new_container);
+                remaining_container = new_container;
             }
+        }
+
+        if !current_row.is_empty() {
+            Self::emit_row(
+                &current_row,
+                result,
+                remaining_container,
+                remaining_container.width >= remaining_container.height,
+            );
         }
     }
 
@@ -160,11 +157,7 @@ impl SquarifiedTreemap {
     /// Picks the direction that gives the best combination of:
     ///   - aspect ratios of items in the current row
     ///   - aspect ratio of the remaining container (weighted 2x)
-    fn pick_direction(
-        row: &[(usize, f32)],
-        container: Rect,
-        total: f32,
-    ) -> bool {
+    fn pick_direction(row: &[(usize, f32)], container: Rect, total: f32) -> bool {
         if total <= 0.0 || container.width <= 0.0 || container.height <= 0.0 {
             return container.width >= container.height;
         }
@@ -194,13 +187,12 @@ impl SquarifiedTreemap {
     /// - low worst/average item aspect ratio (more square-like tiles)
     /// - reasonable remaining container aspect ratio
     /// - explicit penalty for extreme strip-like tiles
-    fn direction_score(
-        row: &[(usize, f32)],
-        container: Rect,
-        total: f32,
-        horizontal: bool,
-    ) -> f32 {
-        let length = if horizontal { container.width } else { container.height };
+    fn direction_score(row: &[(usize, f32)], container: Rect, total: f32, horizontal: bool) -> f32 {
+        let length = if horizontal {
+            container.width
+        } else {
+            container.height
+        };
         let breadth = if length > 0.0 { total / length } else { 0.0 };
 
         // Item aspect stats for this direction
@@ -209,7 +201,11 @@ impl SquarifiedTreemap {
         let mut aspect_count = 0.0f32;
 
         for &(_, size) in row {
-            let item_len = if total > 0.0 { size / total * length } else { 0.0 };
+            let item_len = if total > 0.0 {
+                size / total * length
+            } else {
+                0.0
+            };
             if item_len > 0.001 && breadth > 0.001 {
                 let a = item_len.max(breadth) / item_len.min(breadth);
                 worst_item = worst_item.max(a);
@@ -227,7 +223,11 @@ impl SquarifiedTreemap {
         // Aspect ratio of the remaining container
         let remaining = Self::compute_remaining(container, total, horizontal);
         let rem_aspect = remaining.aspect_ratio();
-        let rem_aspect = if rem_aspect.is_infinite() { 1.0 } else { rem_aspect };
+        let rem_aspect = if rem_aspect.is_infinite() {
+            1.0
+        } else {
+            rem_aspect
+        };
 
         let strip_penalty = if worst_item > STRIP_PENALTY_START {
             (worst_item - STRIP_PENALTY_START) * STRIP_PENALTY_WEIGHT
@@ -256,24 +256,32 @@ impl SquarifiedTreemap {
             container.height
         };
 
+        let max_breadth = if horizontal {
+            container.height
+        } else {
+            container.width
+        };
+
         let row_breadth = if total > 0.0 && length > 0.0 {
-            total / length
+            (total / length).min(max_breadth)
         } else {
             0.0
         };
 
         let mut offset = 0.0f32;
+        let mut cumulative_size = 0.0f64;
 
         for (row_index, &(index, size)) in row.iter().enumerate() {
-            let item_length = if row_index + 1 == row.len() {
-                // Ensure the final item closes the row exactly; avoids float drift
-                // causing tiny gaps or overlaps between neighbors.
-                (length - offset).max(0.0)
+            cumulative_size += size as f64;
+            let item_end = if row_index + 1 == row.len() {
+                length
             } else if total > 0.0 {
-                size / total * length
+                ((cumulative_size / total as f64) * length as f64) as f32
             } else {
                 0.0
-            };
+            }
+            .clamp(offset, length);
+            let item_length = item_end - offset;
 
             let rect = if horizontal {
                 Rect::new(container.x + offset, container.y, item_length, row_breadth)
@@ -286,7 +294,7 @@ impl SquarifiedTreemap {
                 index,
                 is_tiny: false,
             });
-            offset += item_length;
+            offset = item_end;
         }
     }
 
@@ -335,9 +343,18 @@ mod tests {
     #[test]
     fn test_treemap_basic() {
         let items = vec![
-            TreemapItem { size: 100, index: 0 },
-            TreemapItem { size: 200, index: 1 },
-            TreemapItem { size: 300, index: 2 },
+            TreemapItem {
+                size: 100,
+                index: 0,
+            },
+            TreemapItem {
+                size: 200,
+                index: 1,
+            },
+            TreemapItem {
+                size: 300,
+                index: 2,
+            },
         ];
 
         let container = Rect::new(0.0, 0.0, 800.0, 600.0);
@@ -358,8 +375,14 @@ mod tests {
     fn test_dominant_item_no_thin_strip() {
         // Simulates the user's case: one huge item + a few small ones
         let items = vec![
-            TreemapItem { size: 6476, index: 0 }, // "github" ~90%
-            TreemapItem { size: 641, index: 1 },   // "DCIM" ~9%
+            TreemapItem {
+                size: 6476,
+                index: 0,
+            }, // "github" ~90%
+            TreemapItem {
+                size: 641,
+                index: 1,
+            }, // "DCIM" ~9%
             TreemapItem { size: 50, index: 2 },
             TreemapItem { size: 30, index: 3 },
         ];
@@ -379,8 +402,8 @@ mod tests {
         // (constrained by the remaining strip width). This is much better than
         // the old horizontal-only layout which gave ~17:1.
         let dcim = layout.iter().find(|lr| lr.index == 1).unwrap();
-        let dcim_aspect = dcim.rect.width.max(dcim.rect.height)
-            / dcim.rect.width.min(dcim.rect.height);
+        let dcim_aspect =
+            dcim.rect.width.max(dcim.rect.height) / dcim.rect.width.min(dcim.rect.height);
         assert!(
             dcim_aspect < 8.0,
             "DCIM aspect ratio {} is too elongated",
@@ -399,9 +422,15 @@ mod tests {
 
     #[test]
     fn test_many_small_items_do_not_overlap() {
-        let mut items = vec![TreemapItem { size: 5_000, index: 0 }];
+        let mut items = vec![TreemapItem {
+            size: 5_000,
+            index: 0,
+        }];
         for index in 1..50 {
-            items.push(TreemapItem { size: 8 + index as u64, index });
+            items.push(TreemapItem {
+                size: 8 + index as u64,
+                index,
+            });
         }
 
         let container = Rect::new(0.0, 0.0, 1200.0, 780.0);
@@ -432,6 +461,85 @@ mod tests {
                     j
                 );
             }
+        }
+    }
+
+    #[test]
+    fn test_row_breadth_is_clamped_to_remaining_container() {
+        let container = Rect::new(10.0, 20.0, 4.0, 3.0);
+        let row = vec![(0, 10.0), (1, 10.0)];
+        let mut layout = Vec::new();
+
+        SquarifiedTreemap::emit_row(&row, &mut layout, container, true);
+
+        assert_eq!(layout.len(), 2);
+        assert!(layout.iter().all(|item| item.rect.y == container.y));
+        assert!(layout
+            .iter()
+            .all(|item| item.rect.height == container.height));
+        assert!(layout
+            .iter()
+            .all(|item| item.rect.x + item.rect.width <= container.x + container.width));
+    }
+
+    #[test]
+    fn test_large_flat_directory_uses_iterative_layout() {
+        let items: Vec<TreemapItem> = (0..20_000)
+            .map(|index| TreemapItem {
+                size: (index % 97 + 1) as u64,
+                index,
+            })
+            .collect();
+
+        let container = Rect::new(0.0, 0.0, 1600.0, 900.0);
+        let layout = SquarifiedTreemap::layout(&items, container);
+
+        assert_eq!(layout.len(), items.len());
+        assert!(layout.iter().all(|item| item.rect.area() >= 0.0));
+
+        for item in &layout {
+            let rect = item.rect;
+            assert!(rect.x >= container.x - 0.001);
+            assert!(rect.y >= container.y - 0.001);
+            assert!(
+                rect.x + rect.width <= container.x + container.width + 0.01,
+                "rect {:?} exceeds right edge {}",
+                rect,
+                container.x + container.width
+            );
+            assert!(
+                rect.y + rect.height <= container.y + container.height + 0.01,
+                "rect {:?} exceeds bottom edge {}",
+                rect,
+                container.y + container.height
+            );
+        }
+
+        // With every rectangle bounded by the container, excess total area is
+        // a strong signal that rows overlap due to accumulated float error.
+        let total_area: f64 = layout.iter().map(|item| item.rect.area() as f64).sum();
+        assert!(
+            total_area <= container.area() as f64 * 1.000_01,
+            "layout area {total_area} exceeds container area {}",
+            container.area()
+        );
+
+        let mut by_left: Vec<Rect> = layout.iter().map(|item| item.rect).collect();
+        by_left.sort_by(|a, b| a.x.total_cmp(&b.x));
+        let mut active: Vec<Rect> = Vec::new();
+        for rect in by_left {
+            active.retain(|candidate| candidate.x + candidate.width > rect.x + 0.01);
+            for candidate in &active {
+                let overlap_height = (candidate.y + candidate.height).min(rect.y + rect.height)
+                    - candidate.y.max(rect.y);
+                assert!(
+                    overlap_height <= 0.01,
+                    "rectangles {:?} and {:?} overlap",
+                    candidate,
+                    rect
+                );
+            }
+            active.push(rect);
         }
     }
 }

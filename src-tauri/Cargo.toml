@@ -1,0 +1,21 @@
+[package]
+name = "spaceinsight-app"
+version = "0.2.0"
+description = "A fast, visual disk space analyzer"
+authors = ["SpaceInsight contributors"]
+edition = "2021"
+
+[lib]
+name = "spaceinsight_app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2", features = [] }
+tauri-plugin-clipboard-manager = "2"
+tauri-plugin-dialog = "2"
+spaceinsight = { path = ".." }

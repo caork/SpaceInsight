@@ -15,49 +15,6 @@ pub const HEADER_HEIGHT: f32 = 16.0;
 /// Minimal inset on left/right/bottom of expanded folders.
 pub const SIDE_INSET: f32 = 1.0;
 
-// --- Aggregation parameters ---
-
-/// Absolute minimum area (px²) for an item to render individually.
-const MIN_USEFUL_AREA: f32 = 520.0;
-
-/// Minimum fraction of container area. Items below this are too small to see.
-const MIN_AREA_PCT: f32 = 0.0065;
-
-/// Soft cap on individual items per level before aggregation kicks in.
-const PREFERRED_MAX_ITEMS: usize = 10;
-
-/// Maximum fraction of total size the grey block may consume.
-/// If the aggregate would exceed this, items are rescued back out.
-const MAX_AGGREGATE_FRACTION: f32 = 0.08; // 8%
-
-/// Relaxed parameters when user clicks the aggregate block to split small items.
-const SPLIT_MIN_USEFUL_AREA: f32 = 0.0;
-const SPLIT_MIN_AREA_PCT: f32 = 0.0;
-const SPLIT_PREFERRED_MAX_ITEMS: usize = usize::MAX;
-const SPLIT_MAX_AGGREGATE_FRACTION: f32 = 1.0;
-
-#[derive(Clone, Copy)]
-struct AggregatePolicy {
-    min_useful_area: f32,
-    min_area_pct: f32,
-    preferred_max_items: usize,
-    max_aggregate_fraction: f32,
-}
-
-const DEFAULT_AGGREGATION_POLICY: AggregatePolicy = AggregatePolicy {
-    min_useful_area: MIN_USEFUL_AREA,
-    min_area_pct: MIN_AREA_PCT,
-    preferred_max_items: PREFERRED_MAX_ITEMS,
-    max_aggregate_fraction: MAX_AGGREGATE_FRACTION,
-};
-
-const SPLIT_AGGREGATION_POLICY: AggregatePolicy = AggregatePolicy {
-    min_useful_area: SPLIT_MIN_USEFUL_AREA,
-    min_area_pct: SPLIT_MIN_AREA_PCT,
-    preferred_max_items: SPLIT_PREFERRED_MAX_ITEMS,
-    max_aggregate_fraction: SPLIT_MAX_AGGREGATE_FRACTION,
-};
-
 /// A node in the render tree, produced by build_render_tree.
 #[derive(Clone)]
 pub struct RenderNode {
@@ -70,11 +27,11 @@ pub struct RenderNode {
     pub content_rect: Option<Rect>,
     /// Sub-nodes (only populated for expanded folders).
     pub children: Vec<RenderNode>,
-    /// Hash of path for stable egui IDs.
+    /// Hash of path for stable frontend IDs.
     pub stable_id: u64,
-    /// True if this node represents aggregated small items.
+    /// Legacy frontend compatibility; new layouts always return false.
     pub is_aggregate: bool,
-    /// Number of items aggregated (only meaningful if is_aggregate).
+    /// Legacy frontend compatibility; new layouts always return zero.
     pub aggregate_count: usize,
 }
 
@@ -93,77 +50,6 @@ struct ChildInfo {
     is_dir: bool,
 }
 
-/// Partition children into (kept individually, aggregated into grey block).
-///
-/// Three-phase algorithm:
-///   Phase 1 — Area filter: items below the visibility threshold go to aggregate.
-///   Phase 2 — Count cap: if too many items remain, move the smallest to aggregate.
-///   Phase 3 — Budget rescue: if the aggregate is too large (>8% of total),
-///             pull the largest aggregated items back out so the grey block stays small.
-///
-/// This ensures: small noise is swept up, the grey block never dominates,
-/// and the visible layout has a manageable number of well-sized items.
-fn partition_children(
-    children: &[ChildInfo],
-    total_size: u64,
-    container_area: f32,
-    policy: AggregatePolicy,
-) -> (Vec<usize>, Vec<usize>) {
-    let n = children.len();
-    if n == 0 {
-        return (vec![], vec![]);
-    }
-    // children are already sorted by size descending
-
-    let min_area = policy.min_useful_area.max(container_area * policy.min_area_pct);
-
-    // Phase 1: area filter
-    let mut kept: Vec<usize> = Vec::new();
-    let mut aggregated: Vec<usize> = Vec::new();
-
-    for i in 0..n {
-        let estimated_area = if total_size > 0 {
-            children[i].size as f32 / total_size as f32 * container_area
-        } else {
-            0.0
-        };
-        if estimated_area >= min_area {
-            kept.push(i);
-        } else {
-            aggregated.push(i);
-        }
-    }
-
-    // Phase 2: count cap — if too many kept, move smallest to aggregate
-    while kept.len() > policy.preferred_max_items {
-        let removed = kept.pop().unwrap(); // smallest of kept (sorted desc)
-        aggregated.insert(0, removed); // insert at front (it's the largest of aggregated)
-    }
-
-    // Phase 3: budget rescue — if aggregate too large, pull items back
-    let budget = total_size as f64 * policy.max_aggregate_fraction as f64;
-    let mut agg_total: u64 = aggregated.iter().map(|&i| children[i].size).sum();
-
-    while agg_total as f64 > budget && !aggregated.is_empty() {
-        // aggregated is ordered: largest first (from phase 2 inserts), then smallest
-        // Pull the largest item (first element) back to kept
-        let rescued = aggregated.remove(0);
-        agg_total -= children[rescued].size;
-        kept.push(rescued);
-    }
-
-    // Ensure at least 1 individual item
-    if kept.is_empty() && !aggregated.is_empty() {
-        let rescued = aggregated.remove(0);
-        kept.push(rescued);
-    }
-
-    // Re-sort kept by size descending for consistent layout
-    kept.sort_by(|&a, &b| children[b].size.cmp(&children[a].size));
-
-    (kept, aggregated)
-}
-
 /// Build the hierarchical render tree from a FileTree.
 pub fn build_render_tree(
     tree: &FileTree,
@@ -171,19 +57,9 @@ pub fn build_render_tree(
     container: Rect,
     expansion: &ExpansionState,
     max_depth: usize,
-    split_small_items_roots: &HashSet<PathBuf>,
+    _split_small_items_roots: &HashSet<PathBuf>,
 ) -> Vec<RenderNode> {
     let arena = tree.get_arena();
-
-    let Some(root_path) = arena.get(root_id).map(|n| n.get().path.clone()) else {
-        return Vec::new();
-    };
-
-    let aggregation_policy = if split_small_items_roots.contains(&root_path) {
-        SPLIT_AGGREGATION_POLICY
-    } else {
-        DEFAULT_AGGREGATION_POLICY
-    };
 
     let mut children: Vec<ChildInfo> = root_id
         .children(arena)
@@ -208,70 +84,24 @@ pub fn build_render_tree(
     // Sort by size descending
     children.sort_by(|a, b| b.size.cmp(&a.size));
 
-    let total_size: u64 = children.iter().map(|c| c.size).sum();
-    let container_area = container.area();
-
-    let (kept_indices, agg_indices) =
-        partition_children(&children, total_size, container_area, aggregation_policy);
-
-    let aggregate_size: u64 = agg_indices.iter().map(|&i| children[i].size).sum();
-    let aggregate_count = agg_indices.len();
-    let has_aggregate = aggregate_count > 0 && aggregate_size > 0;
-
-    let aggregate_path = container_root_path(root_id, arena);
-    let aggregate_item_index = kept_indices.len(); // treemap index for aggregate
-
-    // Build treemap items
-    let mut items: Vec<TreemapItem> = kept_indices
+    let items: Vec<TreemapItem> = children
         .iter()
         .enumerate()
-        .map(|(treemap_idx, &child_idx)| TreemapItem {
-            size: children[child_idx].size,
-            index: treemap_idx,
+        .map(|(index, child)| TreemapItem {
+            size: child.size,
+            index,
         })
         .collect();
-
-    if has_aggregate {
-        items.push(TreemapItem {
-            size: aggregate_size,
-            index: aggregate_item_index,
-        });
-    }
 
     let layout = SquarifiedTreemap::layout(&items, container);
 
     let mut render_nodes = Vec::with_capacity(layout.len());
 
     for lr in &layout {
-        let treemap_idx = lr.index;
-
-        // Aggregate block
-        if has_aggregate && treemap_idx == aggregate_item_index {
-            let label = if aggregate_count == 1 {
-                "1 small item".to_string()
-            } else {
-                format!("{} small items", aggregate_count)
-            };
-            render_nodes.push(RenderNode {
-                path: aggregate_path.clone(),
-                name: label,
-                size: aggregate_size,
-                is_dir: false,
-                outer_rect: lr.rect,
-                content_rect: None,
-                children: Vec::new(),
-                stable_id: path_hash(&aggregate_path) ^ 0xA66E,
-                is_aggregate: true,
-                aggregate_count,
-            });
+        if lr.index >= children.len() {
             continue;
         }
-
-        if treemap_idx >= kept_indices.len() {
-            continue;
-        }
-        let child_idx = kept_indices[treemap_idx];
-        let child = &children[child_idx];
+        let child = &children[lr.index];
 
         let exp_depth = expansion.depth(&child.path);
         let is_expanded = child.is_dir && exp_depth > 0 && max_depth > 0;
@@ -293,7 +123,7 @@ pub fn build_render_tree(
                     cr,
                     expansion,
                     max_depth - 1,
-                    split_small_items_roots,
+                    _split_small_items_roots,
                 )
             } else {
                 Vec::new()
@@ -321,125 +151,30 @@ pub fn build_render_tree(
     render_nodes
 }
 
-/// Get a synthetic path for the aggregate node under this root.
-fn container_root_path(
-    root_id: indextree::NodeId,
-    arena: &indextree::Arena<crate::tree::TreeNode>,
-) -> PathBuf {
-    arena
-        .get(root_id)
-        .map(|n| {
-            let mut p = n.get().path.clone();
-            p.push("__aggregate__");
-            p
-        })
-        .unwrap_or_else(|| PathBuf::from("__aggregate__"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Helper: simulate partition with given sizes.
-    /// Uses a real Arena to get valid NodeIds.
-    fn make_children(sizes: &[u64]) -> (indextree::Arena<crate::tree::TreeNode>, Vec<ChildInfo>) {
-        let mut arena = indextree::Arena::new();
-        let mut v: Vec<ChildInfo> = sizes
-            .iter()
-            .enumerate()
-            .map(|(i, &s)| {
-                let node_id = arena.new_node(crate::tree::TreeNode {
-                    path: PathBuf::from(format!("item_{}", i)),
-                    name: format!("item_{}", i),
-                    size: s,
-                    cumulative_size: s,
-                    is_dir: false,
-                });
-                ChildInfo {
-                    node_id,
-                    path: PathBuf::from(format!("item_{}", i)),
-                    name: format!("item_{}", i),
-                    size: s,
-                    is_dir: false,
-                }
-            })
-            .collect();
-        v.sort_by(|a, b| b.size.cmp(&a.size));
-        (arena, v)
-    }
-
     #[test]
-    fn test_dominant_item_small_aggregate() {
-        // 90% dominant + 9% medium + 20 tiny items = 1%
-        let mut sizes = vec![9000, 900];
-        for _ in 0..20 {
-            sizes.push(5); // 20 × 5 = 100 = 1%
+    fn build_render_tree_keeps_every_child() {
+        let mut tree = FileTree::new("/test");
+        for index in 0..50 {
+            tree.upsert_node(PathBuf::from(format!("/test/file_{index}")), 100, false);
         }
-        let (_arena, children) = make_children(&sizes);
-        let total: u64 = children.iter().map(|c| c.size).sum();
-        let container_area = 936_000.0;
+        tree.calculate_sizes();
 
-        let (kept, agg) =
-            partition_children(&children, total, container_area, DEFAULT_AGGREGATION_POLICY);
-        let agg_size: u64 = agg.iter().map(|&i| children[i].size).sum();
-        let agg_frac = agg_size as f32 / total as f32;
-
-        // The two big items should be kept; tiny items aggregated
-        assert!(kept.len() >= 2, "Should keep at least the 2 large items, got {}", kept.len());
-        // Aggregate should be small (≤ 8%)
-        assert!(agg_frac <= MAX_AGGREGATE_FRACTION + 0.01,
-                "Aggregate fraction {:.1}% exceeds budget", agg_frac * 100.0);
-    }
-
-    #[test]
-    fn test_many_equal_items_aggregate_stays_small() {
-        // 50 items of equal size — aggregate should not dominate
-        let sizes: Vec<u64> = vec![100; 50];
-        let (_arena, children) = make_children(&sizes);
-        let total: u64 = children.iter().map(|c| c.size).sum();
-        let container_area = 936_000.0;
-
-        let (kept, agg) =
-            partition_children(&children, total, container_area, DEFAULT_AGGREGATION_POLICY);
-        let agg_size: u64 = agg.iter().map(|&i| children[i].size).sum();
-        let agg_frac = agg_size as f32 / total as f32;
-
-        // With 50 equal items, budget rescue should prevent the aggregate from being huge
-        assert!(agg_frac <= MAX_AGGREGATE_FRACTION + 0.01,
-                "Aggregate fraction {:.1}% exceeds budget", agg_frac * 100.0);
-        assert!(kept.len() >= 1, "Should keep at least 1 item");
-    }
-
-    #[test]
-    fn test_few_items_no_aggregate() {
-        // 3 large items — nothing should be aggregated
-        let sizes = vec![5000, 3000, 2000];
-        let (_arena, children) = make_children(&sizes);
-        let total: u64 = children.iter().map(|c| c.size).sum();
-        let container_area = 936_000.0;
-
-        let (kept, agg) =
-            partition_children(&children, total, container_area, DEFAULT_AGGREGATION_POLICY);
-
-        assert_eq!(kept.len(), 3);
-        assert_eq!(agg.len(), 0);
-    }
-
-    #[test]
-    fn test_split_policy_keeps_more_items() {
-        let sizes: Vec<u64> = vec![100; 50];
-        let (_arena, children) = make_children(&sizes);
-        let total: u64 = children.iter().map(|c| c.size).sum();
-        let container_area = 936_000.0;
-
-        let (default_kept, _default_agg) =
-            partition_children(&children, total, container_area, DEFAULT_AGGREGATION_POLICY);
-        let (split_kept, _split_agg) =
-            partition_children(&children, total, container_area, SPLIT_AGGREGATION_POLICY);
-
-        assert!(
-            split_kept.len() > default_kept.len(),
-            "Split mode should keep more individual items"
+        let nodes = build_render_tree(
+            &tree,
+            tree.get_root(),
+            Rect::new(0.0, 0.0, 1000.0, 700.0),
+            &ExpansionState::default(),
+            1,
+            &HashSet::new(),
         );
+
+        assert_eq!(nodes.len(), 50);
+        assert!(nodes.iter().all(|node| !node.is_aggregate));
+        let area: f32 = nodes.iter().map(|node| node.outer_rect.area()).sum();
+        assert!((area - 700_000.0).abs() < 10.0);
     }
 }

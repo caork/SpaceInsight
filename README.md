@@ -1,220 +1,81 @@
-# SpaceInsight 🚀
+# SpaceInsight
 
-![SpaceInsight](img/spaceInsight.jpg)
+SpaceInsight is a fast, cross-platform disk space analyzer. Its Rust scanning
+engine is paired with a Tauri desktop interface and an optional terminal UI.
 
-A blazingly fast disk space analyzer built in Rust, with both a GPU GUI and a clickable terminal TUI. Designed to outperform SpaceSniffer with multi-threaded scanning and real-time treemap visualization.
+## Highlights
 
-![License](https://img.shields.io/badge/license-MIT-blue.svg)
-![Build](https://img.shields.io/badge/build-passing-brightgreen.svg)
+- Parallel file-system scanning with `jwalk` and `rayon`
+- Squarified treemap layout calculated by the shared Rust core
+- Responsive Tauri 2 desktop interface with folder drill-down
+- Live scan progress and top-level preview
+- Native folder picker and file-manager reveal actions
+- Separate mouse-enabled terminal UI
 
-## Features
+## Desktop App
 
-✨ **High-Performance Scanning**
-- Multi-threaded file system crawling using `jwalk`
-- Parallel processing with `rayon` for maximum CPU utilization
-- Memory-efficient arena-based tree structure
+### Requirements
 
-🎨 **Beautiful Visualization**
-- GPU-accelerated treemap rendering with `egui` and `wgpu`
-- Squarified treemap algorithm for optimal aspect ratios
-- Color-coded size visualization
-- Real-time updates during scanning
+- Rust stable
+- Node.js 20 or newer
+- The [Tauri system prerequisites](https://v2.tauri.app/start/prerequisites/)
+  for your platform
 
-⚡ **Optimized for Speed**
-- Zero-copy data handling where possible
-- Link-time optimization (LTO) for smaller binaries
-- Minimal heap allocations
-
-🖥️ **Cross-Platform**
-- Windows
-- macOS
-- Linux
-
-⌨️ **Terminal TUI (Linux-friendly)**
-- Separate executable: `spaceinsight-tui`
-- Clickable treemap tiles in terminal (mouse support)
-- Split-pane interface with typed path input
-- Keyboard controls for zoom/expand/collapse navigation
-
-## Quick Start
-
-### Installation
+### Development
 
 ```bash
-# Clone the repository
-git clone https://github.com/yourusername/SpaceInsight.git
-cd SpaceInsight
+npm install
+npm run tauri dev
+```
 
-# Build the release version
-cargo build --release
+The Vite frontend is also available at `http://localhost:1420` while Tauri is
+running, but file-system commands require the desktop window.
 
-# Run GUI (default)
-cargo run --release --bin spaceinsight
+### Production Build
 
-# Run Terminal TUI
+```bash
+npm run tauri build
+```
+
+Installers and application bundles are written beneath
+`src-tauri/target/release/bundle/`.
+
+## Terminal UI
+
+```bash
 cargo run --release --bin spaceinsight-tui
 ```
 
-### GUI Usage
-
-1. Launch SpaceInsight
-2. Enter a directory path (or leave empty to scan current directory)
-3. Click "Scan" to start the analysis
-4. Watch the treemap populate in real-time!
-
-### TUI Usage
-
-```bash
-./target/release/spaceinsight-tui
-```
-
-- Press `/` to edit path, then `Enter` to scan
-- Left click on tiles to select + expand/collapse folders
-- Right click folder tiles to zoom into them
-- Press `u` (or Backspace) to zoom out one level
+- Press `/` to edit the path and `Enter` to scan
+- Left-click tiles to select or expand folders
+- Right-click a folder to zoom in
+- Press `u` or Backspace to move up
 - Press `q` to quit
 
 ## Architecture
 
-SpaceInsight is built on shared core components plus two frontends:
-
-### 1. File Crawler (`crawler.rs`)
-- Uses `jwalk` for parallel directory traversal
-- Thread-safe statistics with atomic counters
-- Returns a `DashMap` for lock-free concurrent access
-
-### 2. Tree Structure (`tree.rs`)
-- Arena allocator via `indextree` for memory efficiency
-- Bottom-up size calculation
-- Fast parent-child relationships
-
-### 3. Treemap Layout (`treemap.rs`)
-- Implements the Bruls, Huizing, and van Wijk squarified algorithm
-- Recursive partitioning for optimal visualization
-- Handles deep directory hierarchies without stack overflow
-
-### 4. Shared Library (`lib.rs`)
-- Re-exports scanning/layout/render modules for multiple binaries
-- Keeps GUI/TUI entrypoints small and maintainable
-
-### 5. GUI (`main.rs`)
-- `egui` immediate-mode GUI
-- Background thread for non-blocking scans
-- Dynamic color scheme based on file sizes
-
-### 6. TUI (`bin/spaceinsight-tui.rs`)
-- `ratatui` + `crossterm` terminal UI
-- Clickable text-mode treemap with split panes
-- Keyboard + mouse navigation and directory drill-down
-
-## Performance
-
-SpaceInsight is designed to scan **1 million files in under 2 seconds** on modern hardware with:
-- Multi-core CPU utilization via thread pools
-- Minimal memory allocations
-- Stack allocation over heap where possible
-
-## Development
-
-### Prerequisites
-
-- Rust 1.70+ (2021 edition)
-- Cargo
-
-### Building from Source
-
-```bash
-# Debug build
-cargo build
-
-# Release build (optimized)
-cargo build --release
-
-# Run tests
-cargo test
-```
-
-### Linux Binary Compatibility
-
-If you see an error like:
-
 ```text
-./spaceinsight: /lib/x86_64-linux-gnu/libc.so.6: version `GLIBC_2.39' not found
+SpaceInsight/
+├── src/                    Rust scanning, tree, and layout core
+│   └── bin/                Terminal UI entrypoint
+├── src-tauri/              Tauri commands and desktop configuration
+├── ui/                     TypeScript interface and styles
+├── index.html              Vite entrypoint
+└── package.json            Frontend and Tauri scripts
 ```
 
-the binary was built on a newer Linux distribution than your system. Build from source on your machine:
+The Tauri backend keeps the scanned `FileTree` in memory. The frontend requests
+layouts for the current directory, while `build_render_tree` and
+`SquarifiedTreemap` remain the single source of truth for tile geometry.
+
+## Verification
 
 ```bash
-cargo build --release
-./target/release/spaceinsight
-./target/release/spaceinsight-tui
+cargo test
+npm run build
+cargo check --manifest-path src-tauri/Cargo.toml
 ```
-
-GitHub Actions now publishes architecture-specific artifacts:
-
-- `spaceinsight-linux-<x86_64|aarch64>` (GUI, standard Linux build)
-- `spaceinsight-windows-<x86_64|aarch64>` (GUI, standard Windows build)
-- `spaceinsight-macos-<x86_64|aarch64>` (GUI, standard macOS build)
-- `spaceinsight-tui-linux-<x86_64|aarch64>` (TUI, Linux only)
-- `spaceinsight-linux-x86_64-manylinux` (GUI, compatibility build targeting `glibc 2.17`)
-- `spaceinsight-tui-linux-x86_64-manylinux` (TUI, compatibility build targeting `glibc 2.17`, Linux only)
-
-Use `spaceinsight-linux-x86_64-manylinux` if you need maximum distro compatibility.
-
-### Project Structure
-
-```
-SpaceInsight/
-├── src/
-│   ├── lib.rs                  # Shared modules for all binaries
-│   ├── main.rs                 # GUI application (spaceinsight)
-│   ├── bin/
-│   │   └── spaceinsight-tui.rs # Terminal TUI application
-│   ├── crawler.rs              # File system scanner
-│   ├── tree.rs                 # Hierarchical data structure
-│   └── treemap.rs              # Layout algorithm
-├── Cargo.toml        # Dependencies and build config
-└── .github/
-    └── workflows/
-        └── build.yml # CI/CD pipeline
-```
-
-## Dependencies
-
-- **eframe** - Cross-platform GUI framework
-- **jwalk** - Fast parallel directory walking
-- **rayon** - Data parallelism library
-- **indextree** - Arena-based tree structure
-- **dashmap** - Concurrent HashMap
-- **serde** - Serialization framework
-- **ratatui** - Terminal UI framework
-- **crossterm** - Cross-platform terminal input/output
-
-## Roadmap
-
-- [x] Phase 1: Multi-threaded file crawler
-- [x] Phase 2: Squarified treemap algorithm
-- [x] Phase 3: GPU-accelerated UI
-- [x] Phase 4: CI/CD pipeline
-- [ ] Interactive navigation (zoom, pan, drill-down)
-- [ ] File type filtering
-- [ ] Export functionality
-- [ ] Custom color schemes
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
 
 ## License
 
-This project is licensed under the MIT License - see the LICENSE file for details.
-
-## Acknowledgments
-
-- Inspired by [SpaceSniffer](http://www.uderzo.it/main_products/space_sniffer/)
-- Treemap algorithm by Bruls, Huizing, and van Wijk
-- Built with the amazing Rust ecosystem
-
----
-
-**Built with ❤️ and Rust**
+MIT

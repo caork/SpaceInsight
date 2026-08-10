@@ -1,24 +1,19 @@
 [package]
 name = "spaceinsight"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-
-[[bin]]
-name = "spaceinsight"
-path = "src/main.rs"
+autobins = false
 
 [[bin]]
 name = "spaceinsight-tui"
 path = "src/bin/spaceinsight-tui.rs"
 
 [dependencies]
-eframe = "0.26"  # Modern GPU-backed UI
 jwalk = "0.8"    # Fast parallel walking
 rayon = "1.8"    # Multi-threading
 indextree = "4.6" # High-perf Arena tree
 dashmap = "6.1"  # Thread-safe HashMap
 serde = { version = "1.0", features = ["derive"] }
-notify = "8.0"
 ratatui = "0.28"
 crossterm = "0.28"
 

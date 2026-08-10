@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-const PREVIEW_TOP_LIMIT: usize = 40;
+const PREVIEW_TOP_LIMIT: usize = 160;
 const PROGRESS_EMIT_INTERVAL_MS: u64 = 100;
 static INIT_RAYON_POOL: Once = Once::new();
 

@@ -1,2 +1,7 @@
 /target
+/src-tauri/target
+/node_modules
+/dist
+/release
+/design
 .DS_Store
