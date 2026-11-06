@@ -1,3 +1,7 @@
+[workspace]
+members = ["desktop"]
+resolver = "2"
+
 [package]
 name = "spaceinsight"
 version = "0.2.0"

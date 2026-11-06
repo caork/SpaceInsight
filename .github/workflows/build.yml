@@ -1,4 +1,4 @@
-name: Cross-Platform Release
+name: GPUI Desktop and Terminal
 
 on:
   push:
@@ -7,7 +7,21 @@ on:
     branches: [ main ]
 
 jobs:
+  macos-icons:
+    name: Compile native macOS icon
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile Icon Composer catalog
+        run: ./scripts/compile-macos-icon.sh "$RUNNER_TEMP/spaceinsight-icons"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-icon-catalog
+          path: ${{ runner.temp }}/spaceinsight-icons/
+          if-no-files-found: error
+
   build:
+    needs: macos-icons
     name: Build on ${{ matrix.os_name }} (${{ matrix.arch_label }})
     runs-on: ${{ matrix.runs_on }}
     strategy:
@@ -35,7 +49,7 @@ jobs:
             arch_label: x86_64
             exe_suffix: ""
           - os_name: macos
-            runs_on: macos-14
+            runs_on: macos-15
             arch_label: aarch64
             exe_suffix: ""
         
@@ -51,18 +65,25 @@ jobs:
         if: matrix.os_name == 'linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev libgtk-3-dev
+          sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev libxkbcommon-x11-dev libwayland-dev libvulkan-dev
           
+      - name: Install Metal compiler
+        if: matrix.os_name == 'macos'
+        run: |
+          if ! xcrun -sdk macosx metal --version; then
+            xcodebuild -downloadComponent MetalToolchain
+          fi
+
       - name: Build Release (Linux GUI + TUI)
         if: matrix.os_name == 'linux'
-        run: cargo build --release
+        run: cargo build --release --workspace --locked
 
       - name: Build Release (Windows/macOS GUI)
         if: matrix.os_name != 'linux'
-        run: cargo build --release --bin spaceinsight
+        run: cargo build --release --workspace --locked
         
       - name: Run Tests
-        run: cargo test --release
+        run: cargo test --workspace --locked
         
       - name: Upload Artifact (Linux)
         if: matrix.os_name == 'linux'
@@ -85,54 +106,24 @@ jobs:
           name: spaceinsight-windows-${{ matrix.arch_label }}
           path: target/release/spaceinsight${{ matrix.exe_suffix }}
           
+      - name: Download native macOS icon catalog
+        if: matrix.os_name == 'macos'
+        uses: actions/download-artifact@v4
+        with:
+          name: macos-icon-catalog
+          path: ${{ runner.temp }}/spaceinsight-icons
+
+      - name: Bundle macOS app
+        if: matrix.os_name == 'macos'
+        env:
+          SPACEINSIGHT_ICON_DIR: ${{ runner.temp }}/spaceinsight-icons
+        run: |
+          ./scripts/bundle-macos.sh
+          ditto -c -k --sequesterRsrc --keepParent target/release/SpaceInsight.app target/release/SpaceInsight-macos.zip
+
       - name: Upload Artifact (macOS)
         if: matrix.os_name == 'macos'
         uses: actions/upload-artifact@v4
         with:
           name: spaceinsight-macos-${{ matrix.arch_label }}
-          path: target/release/spaceinsight${{ matrix.exe_suffix }}
-
-  build-linux-compatible:
-    name: Build Linux Compatible (glibc 2.17)
-    runs-on: ubuntu-22.04
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          toolchain: stable
-
-      - name: Install Linux dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev libgtk-3-dev
-
-      - name: Install Zig
-        uses: mlugg/setup-zig@v2
-        with:
-          version: latest
-
-      - name: Install cargo-zigbuild
-        run: cargo install --locked cargo-zigbuild
-
-      - name: Build compatible Linux binary
-        run: cargo zigbuild --release --target x86_64-unknown-linux-gnu.2.17
-
-      - name: Verify glibc compatibility
-        run: |
-          objdump -T target/x86_64-unknown-linux-gnu.2.17/release/spaceinsight | grep GLIBC_ | sort -Vu | tail
-          objdump -T target/x86_64-unknown-linux-gnu.2.17/release/spaceinsight-tui | grep GLIBC_ | sort -Vu | tail
-
-      - name: Upload Artifact (Linux manylinux-compatible)
-        uses: actions/upload-artifact@v4
-        with:
-          name: spaceinsight-linux-x86_64-manylinux
-          path: target/x86_64-unknown-linux-gnu.2.17/release/spaceinsight
-
-      - name: Upload Artifact (Linux TUI manylinux-compatible)
-        uses: actions/upload-artifact@v4
-        with:
-          name: spaceinsight-tui-linux-x86_64-manylinux
-          path: target/x86_64-unknown-linux-gnu.2.17/release/spaceinsight-tui
+          path: target/release/SpaceInsight-macos.zip

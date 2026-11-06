@@ -145,6 +145,7 @@ impl App {
             total_files: 0,
             total_dirs: 0,
             total_size: 0,
+            unreadable_entries: 0,
             top_level_preview: Vec::new(),
         });
 

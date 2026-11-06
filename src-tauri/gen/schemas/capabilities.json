@@ -1,1 +1,0 @@
-{"default":{"identifier":"default","description":"SpaceInsight desktop permissions","local":true,"windows":["main"],"permissions":["core:default","clipboard-manager:allow-write-text","dialog:allow-open"]}}

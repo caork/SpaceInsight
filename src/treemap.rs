@@ -1,4 +1,3 @@
-use std::f32;
 
 /// Threshold used to mark tiny items (for rendering decisions only).
 ///
