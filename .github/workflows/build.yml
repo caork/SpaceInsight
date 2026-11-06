@@ -7,7 +7,21 @@ on:
     branches: [ main ]
 
 jobs:
+  macos-icons:
+    name: Compile native macOS icon
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile Icon Composer catalog
+        run: ./scripts/compile-macos-icon.sh "$RUNNER_TEMP/spaceinsight-icons"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-icon-catalog
+          path: ${{ runner.temp }}/spaceinsight-icons/
+          if-no-files-found: error
+
   build:
+    needs: macos-icons
     name: Build on ${{ matrix.os_name }} (${{ matrix.arch_label }})
     runs-on: ${{ matrix.runs_on }}
     strategy:
@@ -53,12 +67,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev libxkbcommon-x11-dev libwayland-dev libvulkan-dev
           
-      - name: Select Xcode with Icon Composer support
-        if: matrix.os_name == 'macos'
-        run: |
-          sudo xcode-select --switch /Applications/Xcode_26.3.app/Contents/Developer
-          xcodebuild -version
-
       - name: Install Metal compiler
         if: matrix.os_name == 'macos'
         run: |
@@ -98,8 +106,17 @@ jobs:
           name: spaceinsight-windows-${{ matrix.arch_label }}
           path: target/release/spaceinsight${{ matrix.exe_suffix }}
           
+      - name: Download native macOS icon catalog
+        if: matrix.os_name == 'macos'
+        uses: actions/download-artifact@v4
+        with:
+          name: macos-icon-catalog
+          path: ${{ runner.temp }}/spaceinsight-icons
+
       - name: Bundle macOS app
         if: matrix.os_name == 'macos'
+        env:
+          SPACEINSIGHT_ICON_DIR: ${{ runner.temp }}/spaceinsight-icons
         run: |
           ./scripts/bundle-macos.sh
           ditto -c -k --sequesterRsrc --keepParent target/release/SpaceInsight.app target/release/SpaceInsight-macos.zip

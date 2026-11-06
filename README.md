@@ -32,6 +32,8 @@ The bundle script creates a locally ad-hoc signed application. Developer ID sign
 
 The macOS icon source is `desktop/resources/AppIcon.icon`. Its treemap and circular lens sit over a system-managed background, allowing macOS 26+ to render light, dark, clear, and tinted icon appearances. Packaging compiles this source into `Assets.car`, merges the compiler's icon metadata into `Info.plist`, and includes the generated `AppIcon.icns` fallback for older systems. The PNG/ICO assets remain available for other platforms. Icon appearance follows the system's icon-style preference, which can be configured separately from window appearance.
 
+CI compiles the architecture-independent icon catalog on macOS 26 and reuses it for both Mac architectures, avoiding the older Intel runner's asset runtime. For packaging with a precompiled catalog, set `SPACEINSIGHT_ICON_DIR` to the output directory of `scripts/compile-macos-icon.sh`. Local rebuilds remove the obsolete static icon; bundle build version 0.3.1 tells macOS to refresh the previous icon registration.
+
 ## Terminal UI
 
 ```sh

@@ -14,15 +14,18 @@ cp "target/$profile/spaceinsight" "$bundle/Contents/MacOS/SpaceInsight"
 rm -f "$bundle/Contents/Resources/icon.icns"
 # Compile the Icon Composer source rather than flattening its appearances into
 # an ICNS. macOS selects the light/dark/clear/tinted rendition from Assets.car.
-icon_metadata=$(mktemp -t spaceinsight-icon)
-trap 'rm -f "$icon_metadata"' EXIT HUP INT TERM
-xcrun actool desktop/resources/AppIcon.icon \
-  --compile "$bundle/Contents/Resources" \
-  --platform macosx \
-  --minimum-deployment-target 11.0 \
-  --app-icon AppIcon \
-  --output-partial-info-plist "$icon_metadata" \
-  --output-format human-readable-text
+icon_build=$(mktemp -d -t spaceinsight-icon)
+trap 'rm -rf "$icon_build"' EXIT HUP INT TERM
+# Icon catalogs are architecture-independent. CI compiles them on modern macOS
+# and reuses them for Intel runners whose older asset runtime cannot render .icon.
+if [ -n "${SPACEINSIGHT_ICON_DIR:-}" ]; then
+  icon_source=$SPACEINSIGHT_ICON_DIR
+else
+  ./scripts/compile-macos-icon.sh "$icon_build"
+  icon_source=$icon_build
+fi
+cp "$icon_source/Assets.car" "$bundle/Contents/Resources/Assets.car"
+cp "$icon_source/AppIcon.icns" "$bundle/Contents/Resources/AppIcon.icns"
 cat > "$bundle/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -40,6 +43,6 @@ cat > "$bundle/Contents/Info.plist" <<'PLIST'
 PLIST
 # Keep the compiler's icon metadata (including CFBundleIconName) in sync with
 # the compiled catalog. actool also emits AppIcon.icns for older macOS.
-/usr/libexec/PlistBuddy -c "Merge $icon_metadata" "$bundle/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Merge $icon_source/icon-info.plist" "$bundle/Contents/Info.plist"
 codesign --force --deep --sign - "$bundle"
 echo "Built $bundle (ad-hoc signed; distribution requires Developer ID signing and notarization)."
