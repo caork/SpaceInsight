@@ -8,6 +8,7 @@ name = "spaceinsight"
 path = "src/main.rs"
 
 [dependencies]
+# Keep Cargo.lock: libc 0.2.186 retains ENOATTR required by GPUI's xattr 0.2.3 on Linux.
 gpui = "=0.2.2"
 spaceinsight = { path = ".." }
 unicode-segmentation = "1.12"

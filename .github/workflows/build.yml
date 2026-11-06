@@ -55,7 +55,10 @@ jobs:
           
       - name: Install Metal compiler
         if: matrix.os_name == 'macos'
-        run: xcodebuild -downloadComponent MetalToolchain
+        run: |
+          if ! xcrun -sdk macosx metal --version; then
+            xcodebuild -downloadComponent MetalToolchain
+          fi
 
       - name: Build Release (Linux GUI + TUI)
         if: matrix.os_name == 'linux'
