@@ -337,13 +337,15 @@ mod tests {
 
     #[test]
     fn test_crawler_basic() {
+        let root = std::env::temp_dir().join(format!("spaceinsight-crawler-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("empty")).unwrap();
+        std::fs::write(root.join("sample.txt"), b"hello").unwrap();
         let mut crawler = FileCrawler::new();
-        let (nodes, stats) = crawler.scan_with_progress(".", None);
-        
-        assert!(stats.total_files > 0 || stats.total_dirs > 0);
-        assert!(!nodes.is_empty());
-        println!("Scanned {} files and {} dirs in {}ms", 
-                 stats.total_files, stats.total_dirs, stats.duration_ms);
+        let (nodes, stats) = crawler.scan_with_progress(&root, None);
+        assert_eq!(stats.total_files, 1);
+        assert_eq!(stats.total_size, 5);
+        assert_eq!(nodes.len(), 3);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

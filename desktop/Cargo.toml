@@ -1,0 +1,13 @@
+[package]
+name = "spaceinsight-desktop"
+version = "0.3.0"
+edition = "2024"
+
+[[bin]]
+name = "spaceinsight"
+path = "src/main.rs"
+
+[dependencies]
+gpui = "=0.2.2"
+spaceinsight = { path = ".." }
+unicode-segmentation = "1.12"
