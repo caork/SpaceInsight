@@ -15,7 +15,7 @@ Choose a folder or type/paste its path, then press **Scan** or Enter. The backgr
 Requirements:
 
 - Current stable Rust (GPUI uses the 2024 edition); GPUI is pinned to `0.2.2` and dependencies are locked.
-- macOS: Xcode, Command Line Tools, and the Metal compiler (`xcodebuild -downloadComponent MetalToolchain`).
+- macOS: Xcode, Command Line Tools, and the Metal compiler (`xcodebuild -downloadComponent MetalToolchain`). Packaging the native adaptive app icon requires Xcode 26 or newer with Icon Composer support.
 - Linux: a working GPU driver, X11 or Wayland, and development packages. On Ubuntu: `sudo apt-get install libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libxkbcommon-x11-dev libssl-dev libwayland-dev libvulkan-dev`.
 - Windows: the MSVC Rust toolchain and Visual Studio C++ build tools; a DirectX 11 capable graphics driver.
 
@@ -23,12 +23,14 @@ GPUI paints its own controls in a native window, rather than using system widget
 
 ```sh
 cargo build --release --workspace --locked
-# macOS app bundle, with the existing application icon:
+# macOS app bundle, with the native adaptive application icon:
 ./scripts/bundle-macos.sh
 open target/release/SpaceInsight.app
 ```
 
 The bundle script creates a locally ad-hoc signed application. Developer ID signing, notarization, Windows installers, and Linux packaging are separate distribution steps; the old Tauri installer pipeline has been removed. No glibc 2.17 compatibility is claimed for the GPU desktop.
+
+The macOS icon source is `desktop/resources/AppIcon.icon`. Its treemap and circular lens sit over a system-managed background, allowing macOS 26+ to render light, dark, clear, and tinted icon appearances. Packaging compiles this source into `Assets.car`, merges the compiler's icon metadata into `Info.plist`, and includes the generated `AppIcon.icns` fallback for older systems. The PNG/ICO assets remain available for other platforms. Icon appearance follows the system's icon-style preference, which can be configured separately from window appearance.
 
 ## Terminal UI
 

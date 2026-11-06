@@ -10,7 +10,17 @@ esac
 bundle=target/$profile/SpaceInsight.app
 mkdir -p "$bundle/Contents/MacOS" "$bundle/Contents/Resources"
 cp "target/$profile/spaceinsight" "$bundle/Contents/MacOS/SpaceInsight"
-cp desktop/resources/icon.icns "$bundle/Contents/Resources/icon.icns"
+# Compile the Icon Composer source rather than flattening its appearances into
+# an ICNS. macOS selects the light/dark/clear/tinted rendition from Assets.car.
+icon_metadata=$(mktemp -t spaceinsight-icon)
+trap 'rm -f "$icon_metadata"' EXIT HUP INT TERM
+xcrun actool desktop/resources/AppIcon.icon \
+  --compile "$bundle/Contents/Resources" \
+  --platform macosx \
+  --minimum-deployment-target 11.0 \
+  --app-icon AppIcon \
+  --output-partial-info-plist "$icon_metadata" \
+  --output-format human-readable-text
 cat > "$bundle/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -22,10 +32,12 @@ cat > "$bundle/Contents/Info.plist" <<'PLIST'
 <key>CFBundleVersion</key><string>0.3.0</string>
 <key>CFBundleShortVersionString</key><string>0.3.0</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleIconFile</key><string>icon.icns</string>
 <key>NSHighResolutionCapable</key><true/>
 <key>NSPrincipalClass</key><string>NSApplication</string>
 </dict></plist>
 PLIST
+# Keep the compiler's icon metadata (including CFBundleIconName) in sync with
+# the compiled catalog. actool also emits AppIcon.icns for older macOS.
+/usr/libexec/PlistBuddy -c "Merge $icon_metadata" "$bundle/Contents/Info.plist"
 codesign --force --deep --sign - "$bundle"
 echo "Built $bundle (ad-hoc signed; distribution requires Developer ID signing and notarization)."
