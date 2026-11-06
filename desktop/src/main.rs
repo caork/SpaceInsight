@@ -34,8 +34,8 @@ fn bytes(value: u64) -> String {
     let units = ["B", "KB", "MB", "GB", "TB", "PB", "EB"];
     let mut amount = value as f64;
     let mut unit = 0;
-    while amount >= 1024. && unit < units.len() - 1 {
-        amount /= 1024.;
+    while amount >= 1000. && unit < units.len() - 1 {
+        amount /= 1000.;
         unit += 1;
     }
     if unit == 0 {
@@ -92,10 +92,11 @@ impl SpaceInsight {
                     .update(cx, |view, cx| {
                         if let Some(progress) = latest {
                             view.status = format!(
-                                "Scanning · {} files · {} folders · {}",
+                                "Scanning · {} files · {} folders · {} · {} unreadable",
                                 progress.total_files,
                                 progress.total_dirs,
-                                bytes(progress.total_size)
+                                bytes(progress.total_size),
+                                progress.unreadable_entries
                             );
                             view.progress = Some(progress);
                         }
@@ -107,8 +108,9 @@ impl SpaceInsight {
                                 view.current = Some(scan.root);
                                 view.tree = Some(Arc::new(scan.tree));
                                 view.status = format!(
-                                    "Scan complete · {:.2}s · unreadable entries are skipped",
-                                    scan.stats.duration_ms as f64 / 1000.
+                                    "Scan complete · {:.2}s · {} unreadable entries skipped",
+                                    scan.stats.duration_ms as f64 / 1000.,
+                                    scan.stats.unreadable_entries
                                 );
                             }
                             Ok(Err(error)) => view.status = error,
@@ -265,8 +267,8 @@ impl Render for SpaceInsight {
         )));
         let paint_hits = hit_map.clone();
         let click_hits = hit_map.clone();
-        let has_data = self.tree.is_some() || self.progress.is_some();
-        let size_label = if self.scanning {
+        let has_data = self.scanning || self.tree.is_some();
+        let size_value = if self.scanning {
             self.progress
                 .as_ref()
                 .map(|p| bytes(p.total_size))
@@ -283,6 +285,7 @@ impl Render for SpaceInsight {
                 })
                 .unwrap_or_default()
         };
+        let size_label = format!("{} · {}", spaceinsight::crawler::size_basis(), size_value);
         let mut crumbs = div()
             .flex()
             .gap_2()
@@ -290,7 +293,14 @@ impl Render for SpaceInsight {
             .min_w_0()
             .overflow_hidden()
             .text_sm();
-        if let (Some(root), Some(current)) = (&self.root, &self.current) {
+        if self.scanning {
+            crumbs = crumbs.child(
+                self.scan_root
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default(),
+            );
+        } else if let (Some(root), Some(current)) = (&self.root, &self.current) {
             let mut paths = vec![root.clone()];
             if let Ok(relative) = current.strip_prefix(root) {
                 let mut path = root.clone();
@@ -462,4 +472,14 @@ fn main() {
         .expect("Unable to open SpaceInsight window");
         cx.activate(true);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn sizes_use_decimal_units_like_macos_storage() {
+        assert_eq!(super::bytes(1_000_000_000), "1.0 GB");
+        assert_eq!(super::bytes(1_000_000), "1.0 MB");
+        assert_eq!(super::bytes(999), "999 B");
+    }
 }

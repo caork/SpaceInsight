@@ -65,10 +65,19 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(10))
             .unwrap()
             .unwrap();
-        assert_eq!(scan.tree.total_size(), 10);
+        let expected = spaceinsight::crawler::file_disk_size(
+            &std::fs::metadata(root.join("nested/你好.txt")).unwrap(),
+        ) + spaceinsight::crawler::file_disk_size(
+            &std::fs::metadata(root.join("root.txt")).unwrap(),
+        );
+        assert_eq!(scan.tree.total_size(), expected);
+        assert_eq!(scan.stats.total_size, expected);
         assert_eq!(scan.stats.total_files, 2);
         assert!(scan.tree.get_node(&root.join("nested/empty")).is_some());
-        assert_eq!(progress.lock().unwrap().as_ref().unwrap().total_size, 10);
+        assert_eq!(
+            progress.lock().unwrap().as_ref().unwrap().total_size,
+            expected
+        );
         assert!(validate_root(&root.join("root.txt")).is_err());
         std::fs::remove_dir_all(root).unwrap();
     }

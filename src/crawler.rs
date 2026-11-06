@@ -1,12 +1,16 @@
 use dashmap::DashMap;
+#[cfg(unix)]
+use dashmap::DashSet;
 use jwalk::WalkDir;
 use rayon::iter::ParallelBridge;
 use rayon::prelude::*;
 use std::ffi::OsString;
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::sync::Once;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::Once;
 use std::time::Instant;
 
 const PREVIEW_TOP_LIMIT: usize = 160;
@@ -26,6 +30,7 @@ pub struct ScanStats {
     pub total_files: u64,
     pub total_dirs: u64,
     pub total_size: u64,
+    pub unreadable_entries: u64,
     pub duration_ms: u128,
 }
 
@@ -44,6 +49,7 @@ pub struct ScanProgress {
     pub total_files: u64,
     pub total_dirs: u64,
     pub total_size: u64,
+    pub unreadable_entries: u64,
     pub top_level_preview: Vec<ScanTopLevelPreview>,
 }
 
@@ -101,7 +107,9 @@ impl FileCrawler {
         }
     }
 
-    fn preview_snapshot(preview_map: &DashMap<OsString, PreviewBucket>) -> Vec<ScanTopLevelPreview> {
+    fn preview_snapshot(
+        preview_map: &DashMap<OsString, PreviewBucket>,
+    ) -> Vec<ScanTopLevelPreview> {
         let mut preview_items: Vec<_> = preview_map
             .iter()
             .map(|entry| {
@@ -173,16 +181,26 @@ impl FileCrawler {
 
         Self::ensure_high_parallelism();
 
+        let exclusions = scan_exclusions(&root_path, cfg!(target_os = "macos"));
+        let unreadable_entries = Arc::new(AtomicU64::new(0));
+        #[cfg(unix)]
+        let seen_files = DashSet::new();
+
         let walker = WalkDir::new(root.as_ref())
+            .follow_links(false)
             .skip_hidden(false)
             .parallelism(jwalk::Parallelism::RayonDefaultPool {
                 busy_timeout: std::time::Duration::from_secs(1),
             })
-            .process_read_dir(|_, _, _, children| {
+            .process_read_dir(move |_, _, _, children| {
                 children.retain(|entry| {
                     entry
                         .as_ref()
-                        .map(|dir_entry| !Self::should_skip_path(&dir_entry.path()))
+                        .map(|dir_entry| {
+                            !exclusions
+                                .iter()
+                                .any(|excluded| dir_entry.path().starts_with(excluded))
+                        })
                         .unwrap_or(true)
                 });
             })
@@ -198,6 +216,7 @@ impl FileCrawler {
                 total_files: 0,
                 total_dirs: 0,
                 total_size: 0,
+                unreadable_entries: 0,
                 top_level_preview: Vec::new(),
             },
         );
@@ -216,14 +235,32 @@ impl FileCrawler {
         let nodes = walker
             .par_bridge()
             .filter_map(|entry| {
-                let entry = entry.ok()?;
+                let entry = entry
+                    .map_err(|_| unreadable_entries.fetch_add(1, Ordering::Relaxed))
+                    .ok()?;
                 let discovered_now = discovered_parallel.fetch_add(1, Ordering::Relaxed) + 1;
 
                 let path = entry.path();
-                let metadata = entry.metadata().ok()?;
-
-                let size = metadata.len();
+                let metadata = entry
+                    .metadata()
+                    .map_err(|_| unreadable_entries.fetch_add(1, Ordering::Relaxed))
+                    .ok()?;
                 let is_dir = metadata.is_dir();
+                // Never charge a symlink target or device's apparent length as disk usage.
+                if !is_dir && !metadata.is_file() {
+                    return None;
+                }
+                let size = if is_dir { 0 } else { file_disk_size(&metadata) };
+                #[cfg(unix)]
+                let size = if !is_dir
+                    && metadata.nlink() > 1
+                    && !seen_files.insert((metadata.dev(), metadata.ino()))
+                {
+                    // Retain each directory entry but attribute shared storage only once.
+                    0
+                } else {
+                    size
+                };
 
                 if is_dir {
                     dir_count.fetch_add(1, Ordering::Relaxed);
@@ -235,19 +272,20 @@ impl FileCrawler {
                 if reporting_enabled {
                     if let Some((name, nested)) = Self::top_level_name(&root_for_workers, &path) {
                         let bucket_is_dir = nested || is_dir;
-                        let mut preview = preview_map
-                            .entry(name.clone())
-                            .or_insert_with(|| PreviewBucket {
-                                size: 0,
-                                is_dir: bucket_is_dir,
-                            });
+                        let mut preview =
+                            preview_map
+                                .entry(name.clone())
+                                .or_insert_with(|| PreviewBucket {
+                                    size: 0,
+                                    is_dir: bucket_is_dir,
+                                });
 
                         if bucket_is_dir {
                             preview.is_dir = true;
                         }
 
                         if !is_dir {
-                            preview.size = preview.size.saturating_add(size.max(1));
+                            preview.size = preview.size.saturating_add(size);
                         }
                     }
 
@@ -262,6 +300,7 @@ impl FileCrawler {
                                 total_files: file_count.load(Ordering::Relaxed),
                                 total_dirs: dir_count.load(Ordering::Relaxed),
                                 total_size: total_size.load(Ordering::Relaxed),
+                                unreadable_entries: unreadable_entries.load(Ordering::Relaxed),
                                 top_level_preview: Self::preview_snapshot(&preview_map),
                             });
                         }
@@ -288,6 +327,7 @@ impl FileCrawler {
                 total_files: self.file_count.load(Ordering::Relaxed),
                 total_dirs: self.dir_count.load(Ordering::Relaxed),
                 total_size: self.total_size.load(Ordering::Relaxed),
+                unreadable_entries: unreadable_entries.load(Ordering::Relaxed),
                 top_level_preview: Self::preview_snapshot(&top_level_preview),
             },
         );
@@ -298,30 +338,45 @@ impl FileCrawler {
             total_files: self.file_count.load(Ordering::Relaxed),
             total_dirs: self.dir_count.load(Ordering::Relaxed),
             total_size: self.total_size.load(Ordering::Relaxed),
+            unreadable_entries: unreadable_entries.load(Ordering::Relaxed),
             duration_ms: duration.as_millis(),
         };
 
         (nodes, stats)
     }
+}
 
-    fn should_skip_path(path: &Path) -> bool {
-        let mut matched = 0usize;
-        const DOCKER_VM_PATH: [&str; 5] = ["Library", "Containers", "com.docker.docker", "Data", "vms"];
+/// Avoid traversing the secondary APFS namespace and other mounted volumes from
+/// the boot-volume view. Explicitly selecting one of these roots still scans it.
+fn scan_exclusions(root: &Path, macos: bool) -> Vec<PathBuf> {
+    if !macos {
+        return Vec::new();
+    }
+    ["/System/Volumes", "/Volumes", "/dev"]
+        .into_iter()
+        .map(PathBuf::from)
+        .filter(|excluded| excluded.starts_with(root) && !root.starts_with(excluded))
+        .collect()
+}
 
-        for component in path.components() {
-            let Some(part) = component.as_os_str().to_str() else {
-                continue;
-            };
+/// Allocated file bytes (not logical length): sparse and compressed files must
+/// not be charged for holes. Windows currently falls back to logical length.
+pub fn file_disk_size(metadata: &std::fs::Metadata) -> u64 {
+    #[cfg(unix)]
+    {
+        metadata.blocks().saturating_mul(512)
+    }
+    #[cfg(not(unix))]
+    {
+        metadata.len()
+    }
+}
 
-            if part == DOCKER_VM_PATH[matched] {
-                matched += 1;
-                if matched == DOCKER_VM_PATH.len() {
-                    return true;
-                }
-            }
-        }
-
-        false
+pub fn size_basis() -> &'static str {
+    if cfg!(unix) {
+        "Allocated"
+    } else {
+        "Logical"
     }
 }
 
@@ -337,25 +392,126 @@ mod tests {
 
     #[test]
     fn test_crawler_basic() {
-        let root = std::env::temp_dir().join(format!("spaceinsight-crawler-{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("spaceinsight-crawler-{}", std::process::id()));
         std::fs::create_dir_all(root.join("empty")).unwrap();
         std::fs::write(root.join("sample.txt"), b"hello").unwrap();
         let mut crawler = FileCrawler::new();
         let (nodes, stats) = crawler.scan_with_progress(&root, None);
         assert_eq!(stats.total_files, 1);
-        assert_eq!(stats.total_size, 5);
+        assert_eq!(
+            stats.total_size,
+            file_disk_size(&std::fs::metadata(root.join("sample.txt")).unwrap())
+        );
         assert_eq!(nodes.len(), 3);
         std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn test_skip_abnormal_docker_vm_path() {
-        let docker_vm_file = Path::new(
-            "/Users/demo/Library/Containers/com.docker.docker/Data/vms/0/data/Docker.raw",
+    fn macos_namespace_policy_preserves_explicit_volume_scans() {
+        let exclusions = scan_exclusions(Path::new("/"), true);
+        for path in [
+            "/System/Volumes/Data/Users/alice",
+            "/System/Volumes/Preboot",
+            "/Volumes/External",
+            "/dev/fd",
+        ] {
+            assert!(exclusions
+                .iter()
+                .any(|root| Path::new(path).starts_with(root)));
+        }
+        for path in [
+            "/Users/alice",
+            "/Applications",
+            "/Library",
+            "/System/Library",
+            "/private",
+            "/System/VolumesBackup",
+        ] {
+            assert!(!exclusions
+                .iter()
+                .any(|root| Path::new(path).starts_with(root)));
+        }
+        assert!(scan_exclusions(Path::new("/System/Volumes/Data"), true).is_empty());
+        assert!(scan_exclusions(Path::new("/Volumes/External"), true).is_empty());
+        assert!(scan_exclusions(Path::new("/"), false).is_empty());
+        assert_eq!(
+            scan_exclusions(Path::new("/System"), true),
+            vec![PathBuf::from("/System/Volumes")]
         );
-        let normal_file = Path::new("/Users/demo/Documents/test.txt");
+    }
+    #[test]
+    fn missing_root_reports_unreadable_entry() {
+        let root =
+            std::env::temp_dir().join(format!("spaceinsight-missing-{}", std::process::id()));
+        let (nodes, stats) = FileCrawler::new().scan_with_progress(root, None);
+        assert!(nodes.is_empty());
+        assert_eq!(stats.total_size, 0);
+        assert!(stats.unreadable_entries > 0);
+    }
 
-        assert!(FileCrawler::should_skip_path(docker_vm_file));
-        assert!(!FileCrawler::should_skip_path(normal_file));
+    #[cfg(unix)]
+    #[test]
+    fn sparse_files_hard_links_and_preview_agree_with_du() {
+        use std::io::{Seek, SeekFrom, Write};
+        let root =
+            std::env::temp_dir().join(format!("spaceinsight-allocated-{}", std::process::id()));
+        // Include the formerly excluded Docker path: allocated VM space is real usage.
+        let vm = root.join("Library/Containers/com.docker.docker/Data/vms");
+        std::fs::create_dir_all(&vm).unwrap();
+        let path = vm.join("Docker.raw");
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.seek(SeekFrom::Start(1024 * 1024 * 1024)).unwrap();
+        file.write_all(b"actually allocated").unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        let alias = root.join("hard-link");
+        std::fs::hard_link(&path, &alias).unwrap();
+        std::os::unix::fs::symlink(&root, root.join("loop")).unwrap();
+        std::fs::write(root.join("empty"), b"").unwrap();
+        let final_progress = Arc::new(std::sync::Mutex::new(None));
+        let slot = final_progress.clone();
+        let reporter = Arc::new(move |p| {
+            *slot.lock().unwrap() = Some(p);
+        });
+        let (nodes, stats) = FileCrawler::new().scan_with_progress(&root, Some(reporter));
+        assert_eq!(stats.total_files, 3); // two hard-link entries plus the empty file
+        assert_eq!(stats.unreadable_entries, 0);
+        assert!(stats.total_size > 0 && stats.total_size < 1024 * 1024);
+        assert_eq!(nodes.iter().map(|n| n.size).sum::<u64>(), stats.total_size);
+        assert!(nodes.iter().any(|n| n.path == path));
+        assert!(!nodes.iter().any(|n| n.path == root.join("loop")));
+        let progress = final_progress.lock().unwrap();
+        let progress = progress.as_ref().unwrap();
+        assert_eq!(progress.total_size, stats.total_size);
+        assert_eq!(
+            progress
+                .top_level_preview
+                .iter()
+                .map(|p| p.size)
+                .sum::<u64>(),
+            stats.total_size
+        );
+        let du = std::process::Command::new("du")
+            .arg("-k")
+            .arg(&path)
+            .arg(&alias)
+            .output()
+            .unwrap();
+        assert!(du.status.success());
+        let du_bytes: u64 = String::from_utf8(du.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| {
+                line.split_whitespace()
+                    .next()
+                    .unwrap()
+                    .parse::<u64>()
+                    .unwrap()
+                    * 1024
+            })
+            .sum();
+        assert_eq!(stats.total_size, du_bytes);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

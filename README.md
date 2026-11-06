@@ -48,7 +48,11 @@ cargo run --release --locked --bin spaceinsight-tui
 - `desktop/src/input.rs`: editable path with selection, clipboard, Unicode boundaries, and platform IME integration, adapted from GPUI's input example. See `desktop/NOTICE` and `desktop/LICENSE-APACHE`.
 - `scripts/bundle-macos.sh`: macOS application bundle.
 
-Both desktop and terminal reuse the shared Rust scanning/layout core. File-system work and tree construction run off the UI thread. The scanner skips unreadable entries and its existing Docker VM exclusion remains in effect; sizes represent discovered logical file sizes, not allocated disk blocks. Scans currently cannot be cancelled. Custom controls and the canvas do not yet expose a complete accessibility tree, and keyboard-only tile navigation is not implemented. Platform IME hooks are present; full interactive IME composition still needs manual validation. Closing the last window quits the app.
+Both desktop and terminal reuse the shared Rust scanning/layout core. File-system work and tree construction run off the UI thread. On macOS/Linux, the scanner sums allocated file blocks (512 bytes per `st_blocks` unit), counts hard-linked storage once, and skips symlinks/devices. Sparse and compressed files are charged for allocated bytes, including Docker VM images. Windows currently falls back to logical file length and the UI labels this explicitly. Desktop units use decimal KB/MB/GB, matching macOS Storage.
+
+For a macOS boot-root scan, `/System/Volumes`, `/Volumes`, and `/dev` are excluded: the secondary APFS namespace duplicates the unified root view and external disks/devices are outside the boot-volume scope. Explicitly selecting a volume under those locations still scans it. Unreadable entry counts are reported.
+
+The displayed **Allocated** total is the sum of readable file allocations, not the system's used-space meter: protected content, snapshots, filesystem metadata, purgeable storage and APFS clone/shared extents can cause differences. Shared clone extents are not deduplicated. Empty/fully sparse files have zero area in the treemap. You can audit scanner/progress/tree totals with `cargo run --release --example scan-summary -- /path/to/folder`. Scans currently cannot be cancelled. Custom controls and the canvas do not yet expose a complete accessibility tree, and keyboard-only tile navigation is not implemented. Platform IME hooks are present; full interactive IME composition still needs manual validation. Closing the last window quits the app.
 
 ## Verification
 
