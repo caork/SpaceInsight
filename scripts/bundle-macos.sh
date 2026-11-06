@@ -10,6 +10,8 @@ esac
 bundle=target/$profile/SpaceInsight.app
 mkdir -p "$bundle/Contents/MacOS" "$bundle/Contents/Resources"
 cp "target/$profile/spaceinsight" "$bundle/Contents/MacOS/SpaceInsight"
+# Remove the former static icon when rebuilding an existing local bundle.
+rm -f "$bundle/Contents/Resources/icon.icns"
 # Compile the Icon Composer source rather than flattening its appearances into
 # an ICNS. macOS selects the light/dark/clear/tinted rendition from Assets.car.
 icon_metadata=$(mktemp -t spaceinsight-icon)
@@ -29,7 +31,7 @@ cat > "$bundle/Contents/Info.plist" <<'PLIST'
 <key>CFBundleDisplayName</key><string>SpaceInsight</string>
 <key>CFBundleExecutable</key><string>SpaceInsight</string>
 <key>CFBundleIdentifier</key><string>com.hawkingrad.spaceinsight</string>
-<key>CFBundleVersion</key><string>0.3.0</string>
+<key>CFBundleVersion</key><string>0.3.1</string>
 <key>CFBundleShortVersionString</key><string>0.3.0</string>
 <key>CFBundlePackageType</key><string>APPL</string>
 <key>NSHighResolutionCapable</key><true/>
